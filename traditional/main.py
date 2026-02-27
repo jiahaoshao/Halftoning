@@ -33,7 +33,7 @@ if __name__ == "__main__":
 
     # 加载VOC数据集样本
     voc_train = datasets.VOCSegmentation(
-        root='../data',
+        root='../dataset',
         year='2012',
         image_set='train',
         download=DOWNLOAD_VOC2012,

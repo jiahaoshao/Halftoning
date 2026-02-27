@@ -1,0 +1,41 @@
+{
+    "name": "halftoning_dev",
+    "model": "PolicyNetwork",
+	"data_dir": "dataset/VOCdevkit/VOC2012",
+	"save_dir": "./",
+    "initial_ckpt": "halftoning_dev/model_last.pth.tar",
+    "trainer": {
+        "epochs": 1000,
+        "save_epochs": 1,
+        "use_amp": true
+    },
+    "data_loader": {
+        "num_images": null,
+        "crop_size": 64,
+        "batch_size": 48,
+        "shuffle": true,
+        "num_workers": 16
+    },
+    "cuda": true,
+    "w_s": 0.06,
+    "w_a": 0.002,
+    "quantizeLoss": "binL1",
+    "quantizeLossWeight": 0.2,
+    "toneLoss": "gaussianL2",
+    "toneLossWeight": 0.6,
+    "structureLoss": "ssimLoss",
+    "structureLossWeight": 0.0,
+    "blueNoiseLossWeight": 0.3,
+    "featureLossWeight": 1.0,
+    "optimizer_type": "Adam",
+    "optimizer": {
+        "lr": 3e-4,
+        "weight_decay": 0
+    },
+    "lr_scheduler_type": "CosineAnnealingLR",
+    "lr_scheduler": {
+        "T_max": 200000,
+        "eta_min": 1e-5
+    },
+    "seed": 131
+}

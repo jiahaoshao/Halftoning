@@ -295,8 +295,8 @@ def check_contone_dir(contone_dir):
             f"数据目录不存在: {abs_path}\n"
             f"解决方法：\n"
             f"1) 确认目录存在并填写正确路径，例如使用绝对路径:\n"
-            f"   train_halftone_cgan(contone_dir=r'D:\\GraduationProject\\Code\\Halftoning\\data\\VOCdevkit\\VOC2012\\JPEGImages')\n"
-            f"2) 或者从项目根目录启动脚本，使相对路径 `../data/...` 有效。\n"
+            f"   train_halftone_cgan(contone_dir=r'D:\\GraduationProject\\Code\\Halftoning\\dataset\\VOCdevkit\\VOC2012\\JPEGImages')\n"
+            f"2) 或者从项目根目录启动脚本，使相对路径 `../dataset/...` 有效。\n"
             f"3) 若尚未下载数据，请先准备数据集到该目录。"
         )
 
@@ -304,11 +304,11 @@ def check_contone_dir(contone_dir):
 if __name__ == "__main__":
 
     # 1. 训练（需提前准备连续调图像文件夹，如VOC2012的灰度图子集）
-    check_contone_dir("../../data/VOCdevkit/VOC2012/JPEGImages")  # 检查数据目录是否存在
-    train_halftone_cgan(contone_dir="../../data/VOCdevkit/VOC2012/JPEGImages", epochs=50)
+    check_contone_dir("../../dataset/VOCdevkit/VOC2012/JPEGImages")  # 检查数据目录是否存在
+    train_halftone_cgan(contone_dir="../../dataset/VOCdevkit/VOC2012/JPEGImages", epochs=50)
 
     # 2. 推理（使用训练好的模型生成半色调图像）
     infer_halftone(
-        contone_path="../../data/VOCdevkit/VOC2012/JPEGImages/2007_000032.jpg.png",  # 测试连续调图像路径
+        contone_path="../../dataset/VOCdevkit/VOC2012/JPEGImages/2007_000032.jpg.png",  # 测试连续调图像路径
         model_path="halftone_generator.pth"  # 训练好的模型路径
     )

@@ -25,7 +25,6 @@ class Trainer:
         self.device = torch.device("cuda" if self.with_cuda else "cpu")
         self.use_amp = config['trainer']['use_amp']
         self.seed = config['seed']
-        self.z = None
         self.start_epoch = 0
         self.save_freq = config['trainer']['save_epochs']
         self.checkpoint_dir = os.path.join(config['save_dir'], self.name)
@@ -63,12 +62,9 @@ class Trainer:
         # 损失函数
         self.marl_loss_fn = COMALoss(self.reward_calc)
 
-        # resume checkpoint or load warm-up checkpoint
-        checkpt_path = self.config['initial_ckpt']
         if self.resume_path:
-            checkpt_path = self.resume_path
-        assert os.path.exists(checkpt_path), 'Invalid checkpoint Path: %s' % checkpt_path
-        self.load_checkpoint(checkpt_path)
+            assert os.path.exists(self.resume_path), 'Invalid checkpoint Path: %s' % self.resume_path
+            self.load_checkpoint(self.resume_path)
 
     def _train(self):
         torch.manual_seed(self.seed)
@@ -95,13 +91,12 @@ class Trainer:
                 self.logger.info("---------- saving model ...")
                 self.save_checkpoint(epoch)
             if self.monitor_best > epoch_metric:
+                self.logger.info("---------- saving best model ...")
                 self.monitor_best = epoch_metric
                 self.save_checkpoint(epoch, save_best=True)
 
         self.logger.info("Training finished! consumed %f sec", time.time() - start_time)
 
-    def _to_variable(self, data, target):
-        return data.to(self.device), target.to(self.device)
 
     def _train_epoch(self, epoch):
         self.model.train()
@@ -110,14 +105,15 @@ class Trainer:
         epoch_loss_total = 0.0
 
         for batch_idx, (c, _) in enumerate(self.train_data_loader):
+            c = c.to(self.device)
             # 生成高斯噪声
-            self.z = torch.randn_like(c) * 0.3
+            z = torch.randn_like(c) * 0.3
+            z = z.to(self.device)
 
-            c, self.z = self._to_variable(c, self.z)
             # 混合精度上下文
             with torch.amp.autocast('cuda', enabled=self.use_amp):
                 self.optimizer.zero_grad()
-                prob = self.model(c, self.z)  # 网络原始输出 (B,1,H,W)
+                prob = self.model(c, z)  # 网络原始输出 (B,1,H,W)
 
                 # 现在再采样
                 h_sampled = torch.bernoulli(prob)
@@ -128,7 +124,7 @@ class Trainer:
                 # 各向异性抑制损失（对恒定灰度图）
                 B, _, H, W = c.shape
                 c_gray = torch.rand(B, 1, H, W, device=self.device)
-                z_gray = torch.randn_like(c_gray) * 0.1
+                z_gray = torch.randn_like(c_gray) * 0.3
                 prob_gray = self.model(c_gray, z_gray)
                 loss_aniso = anisotropic_loss(prob_gray)
 
@@ -160,14 +156,17 @@ class Trainer:
         return epoch_loss
 
 
-
     def _valid_epoch(self, epoch):
         self.model.eval()
         total_loss = 0
         with torch.no_grad():
             for batch_idx, (c, _) in enumerate(self.train_data_loader):
-                c, self.z = self._to_variable(c, self.z)
-                prob = self.model(c, self.z)  # 网络原始输出 (B,1,H,W)
+                c = c.to(self.device)
+                # 生成高斯噪声
+                z = torch.randn_like(c) * 0.3
+                z = z.to(self.device)
+
+                prob = self.model(c, z)  # 网络原始输出 (B,1,H,W)
 
                 # 现在再采样
                 h_sampled = torch.bernoulli(prob)
@@ -178,7 +177,7 @@ class Trainer:
                 # 各向异性抑制损失（对恒定灰度图）
                 B, _, H, W = c.shape
                 c_gray = torch.rand(B, 1, H, W, device=self.device)
-                z_gray = torch.randn_like(c_gray) * 0.1
+                z_gray = torch.randn_like(c_gray) * 0.3
                 prob_gray = self.model(c_gray, z_gray)
                 loss_aniso = anisotropic_loss(prob_gray)
 
@@ -189,6 +188,8 @@ class Trainer:
                 h = (prob > 0.5).float()
                 h_imgs = tensor2array(h)
                 save_images_from_batch(h_imgs, self.val_halftone, None, batch_idx)
+
+                print("Validation: [%d/%d] iter:%d loss:%4.4f " % (epoch + 1, self.n_epochs, batch_idx + 1, loss.item()))
 
             return total_loss
 

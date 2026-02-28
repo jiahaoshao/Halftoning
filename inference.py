@@ -1,16 +1,19 @@
+import imageio
 import numpy as np
 import cv2
 import os, argparse
 from glob import glob
 
 import torch
-import torch.nn.functional as F
-from agent.model import PolicyNetwork
+
+from agent.model import HalftoningPolicyNet
 from utils import util
 from collections import OrderedDict
 
+
+
 class Inferencer:
-    def __init__(self, checkpoint_path, model, use_cuda=True):
+    def __init__(self, checkpoint_path, model, use_cuda=False):
         self.checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'))
         self.raw_state = self.checkpoint.get('state_dict', self.checkpoint)
         self.device = torch.device("cuda" if use_cuda and torch.cuda.is_available() else "cpu")
@@ -33,9 +36,8 @@ class Inferencer:
         if torch.cuda.is_available():
             torch.cuda.manual_seed(131)
         with torch.no_grad():
-            z = (torch.randn_like(c) * 0.3).to(self.device)
             c = c.to(self.device)
-            prob = self.model(c, z)  # 网络原始输出 (B,1,H,W)
+            prob = self.model(c)  # 网络原始输出 (B,1,H,W)
             h = (prob > 0.5).float()
         return h
 
@@ -52,7 +54,7 @@ if __name__ == '__main__':
 
     halftoning = Inferencer(
         checkpoint_path=args.model,
-        model=PolicyNetwork()
+        model=HalftoningPolicyNet()
     )
     save_dir = os.path.join(args.save_dir)
     util.ensure_dir(save_dir)

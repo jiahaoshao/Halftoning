@@ -6,12 +6,11 @@ import torch
 import torch.optim as optim
 import os
 from torch.backends import cudnn
-from agent.losses import COMALoss
-from agent.rewards import RewardCalculator
+from agent.loss import HalftoneMARLLoss, TotalHalftoneLoss
 from utils.logger import setup_logging
 from utils.dataset import get_dataloader
-from utils.util import gaussian_kernel, anisotropic_loss, ensure_dir, save_list, tensor2array, save_images_from_batch
-from agent.model import PolicyNetwork
+from utils.util import ensure_dir, save_list, tensor2array, save_images_from_batch
+from agent.model import HalftoningPolicyNet
 
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
@@ -38,7 +37,7 @@ class Trainer:
         ensure_dir(self.val_halftone)
 
         ## model
-        self.model = eval(config['model'])().to(self.device)
+        self.model = HalftoningPolicyNet().to(self.device)
 
         ## optimizer
         self.optimizer = getattr(optim, config['optimizer_type'])(self.model.parameters(), **config['optimizer'])
@@ -54,13 +53,15 @@ class Trainer:
         self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
 
         # HVS核
-        self.hvs_kernel = gaussian_kernel(size=11, sigma=1.5).to(self.device)  # (11,11)
+        # self.hvs_kernel = gaussian_kernel(size=11, sigma=1.5).to(self.device)  # (11,11)
 
         # 奖励计算器
-        self.reward_calc = RewardCalculator(self.hvs_kernel, w_s=config['w_s'])
+        # self.reward_calc = RewardCalculator(self.hvs_kernel, w_s=config['w_s'])
 
         # 损失函数
-        self.marl_loss_fn = COMALoss(self.reward_calc)
+        # self.marl_loss_fn = HalftoneMARLLoss(self.reward_calc)
+
+        self.total_loss_fn = TotalHalftoneLoss(ws=0.06, wa=0.002)
 
         if self.resume_path:
             assert os.path.exists(self.resume_path), 'Invalid checkpoint Path: %s' % self.resume_path
@@ -78,10 +79,10 @@ class Trainer:
             ep_st = time.time()
             epoch_loss = self._train_epoch(epoch)
             # perform lr_scheduler
-            self.lr_scheduler.step()
             epoch_lr = self.optimizer.state_dict()['param_groups'][0]['lr']
+            self.lr_scheduler.step()
             epoch_metric = self._valid_epoch(epoch)
-            self.logger.info("[*] --- epoch: %d/%d | loss: %4.4f | metric: %4.4f | time-consumed: %4.2fs ---", epoch + 1, self.n_epochs, epoch_loss['loss_total'], epoch_metric, time.time() - ep_st)
+            self.logger.info("[*] --- epoch: %d/%d | loss: %4.4f | metric: %4.4f | time-consumed: %4.2fs ---", epoch + 1, self.n_epochs, epoch_loss['total_loss'], epoch_metric, time.time() - ep_st)
 
             # save losses and learning rate
             epoch_loss['metric'] = epoch_metric
@@ -100,58 +101,47 @@ class Trainer:
 
     def _train_epoch(self, epoch):
         self.model.train()
-        epoch_loss_marl = 0.0
-        epoch_loss_aniso = 0.0
-        epoch_loss_total = 0.0
+        epoch_marl_loss = 0.0
+        epoch_las_loss = 0.0
+        epoch_total_loss = 0.0
 
         for batch_idx, (c, _) in enumerate(self.train_data_loader):
-            c = c.to(self.device)
-            # 生成高斯噪声
-            z = torch.randn_like(c) * 0.3
-            z = z.to(self.device)
-
             # 混合精度上下文
             with torch.amp.autocast('cuda', enabled=self.use_amp):
-                self.optimizer.zero_grad()
+                c = c.to(self.device)
+                z = torch.randn_like(c) * 0.3
                 prob = self.model(c, z)  # 网络原始输出 (B,1,H,W)
 
-                # 现在再采样
-                h_sampled = torch.bernoulli(prob)
+                B, C, H, W = c.shape
+                cg = torch.rand(B, C, H, W).uniform_(0, 1).to(self.device)  # 恒定灰度图
+                zg = torch.randn(B, C, H, W).to(self.device)
+                prob_cg = self.model(cg, zg)  # 恒定灰度图的输出 (B,1,H,W)
 
-                # 计算MARL损失
-                loss_marl = self.marl_loss_fn(prob, c, h_sampled)
+                # 计算损失
+                total_loss, marl_loss, las_loss = self.total_loss_fn(prob, c, z, prob_cg)
 
-                # 各向异性抑制损失（对恒定灰度图）
-                B, _, H, W = c.shape
-                c_gray = torch.rand(B, 1, H, W, device=self.device)
-                z_gray = torch.randn_like(c_gray) * 0.3
-                prob_gray = self.model(c_gray, z_gray)
-                loss_aniso = anisotropic_loss(prob_gray)
+                # 反向传播
+                self.optimizer.zero_grad()
+                if self.use_amp:
+                    self.scaler.scale(total_loss).backward()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    total_loss.backward()
+                    self.optimizer.step()
 
-                # 总损失
-                loss = loss_marl + self.config['w_a'] * loss_aniso
+                # 记录损失
+                epoch_marl_loss += marl_loss.item()
+                epoch_las_loss += las_loss.item()
+                epoch_total_loss += total_loss.item()
 
-            # 反向传播
-            if self.use_amp:
-                self.scaler.scale(loss).backward()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                loss.backward()
-                self.optimizer.step()
-
-            # 记录损失
-            epoch_loss_marl += loss_marl.item()
-            epoch_loss_aniso += loss_aniso.item()
-            epoch_loss_total += loss.item()
-
-            if batch_idx % self.save_freq == 0:
-                self.logger.info("[%d/%d] iter:%d loss:%4.4f ", epoch + 1, self.n_epochs, batch_idx + 1, loss.item())
+                if batch_idx % self.save_freq == 0:
+                    self.logger.info("[%d/%d] iter:%d loss:%4.4f ", epoch + 1, self.n_epochs, batch_idx + 1, total_loss.item())
 
         epoch_loss = dict()
-        epoch_loss['loss_marl'] = epoch_loss_marl / len(self.train_data_loader)
-        epoch_loss['loss_aniso'] = epoch_loss_aniso / len(self.train_data_loader)
-        epoch_loss['loss_total'] = epoch_loss_total / len(self.train_data_loader)
+        epoch_loss['marl_loss'] = epoch_marl_loss / len(self.train_data_loader)
+        epoch_loss['las_loss'] = epoch_las_loss / len(self.train_data_loader)
+        epoch_loss['total_loss'] = epoch_total_loss / len(self.train_data_loader)
 
         return epoch_loss
 
@@ -162,34 +152,23 @@ class Trainer:
         with torch.no_grad():
             for batch_idx, (c, _) in enumerate(self.train_data_loader):
                 c = c.to(self.device)
-                # 生成高斯噪声
                 z = torch.randn_like(c) * 0.3
-                z = z.to(self.device)
-
                 prob = self.model(c, z)  # 网络原始输出 (B,1,H,W)
 
-                # 现在再采样
-                h_sampled = torch.bernoulli(prob)
+                B, C, H, W = c.shape
+                cg = torch.rand(B, C, H, W).uniform_(0, 1).to(self.device)  # 恒定灰度图
+                zg = torch.randn(B, C, H, W).to(self.device)
+                prob_cg = self.model(cg, zg)  # 恒定灰度图的输出 (B,1,H,W)
 
-                # 计算MARL损失
-                loss_marl = self.marl_loss_fn(prob, c, h_sampled)
-
-                # 各向异性抑制损失（对恒定灰度图）
-                B, _, H, W = c.shape
-                c_gray = torch.rand(B, 1, H, W, device=self.device)
-                z_gray = torch.randn_like(c_gray) * 0.3
-                prob_gray = self.model(c_gray, z_gray)
-                loss_aniso = anisotropic_loss(prob_gray)
-
-                # 总损失
-                loss = loss_marl + self.config['w_a'] * loss_aniso
+                # 计算损失
+                loss, marl_loss, las_loss = self.total_loss_fn(prob, c, z, prob_cg)
                 total_loss += loss.item()
 
                 h = (prob > 0.5).float()
                 h_imgs = tensor2array(h)
                 save_images_from_batch(h_imgs, self.val_halftone, None, batch_idx)
 
-                print("Validation: [%d/%d] iter:%d loss:%4.4f " % (epoch + 1, self.n_epochs, batch_idx + 1, loss.item()))
+                self.logger.info("Validation: [%d/%d] iter:%d loss:%4.4f " % (epoch + 1, self.n_epochs, batch_idx + 1, loss.item()))
 
             return total_loss
 

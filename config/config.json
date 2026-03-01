@@ -1,7 +1,10 @@
 {
     "name": "halftoning_dev",
     "model": "HalftoningPolicyNet",
-	"data_dir": "dataset/VOCdevkit/VOC2012",
+	"data_dir": "dataset/",
+    "train_data_dir": "dataset/HalftoneVOC2012/train",
+    "val_data_dir": "dataset/HalftoneVOC2012/val",
+    "test_data_dir": "dataset/HalftoneVOC2012/test",
 	"save_dir": "./",
     "initial_ckpt": "halftoning_dev/model_last.pth.tar",
     "trainer": {
@@ -10,8 +13,6 @@
         "use_amp": true
     },
     "data_loader": {
-        "num_images": 64,
-        "crop_size": 64,
         "batch_size": 64,
         "shuffle": true,
         "num_workers": 16
@@ -35,7 +36,8 @@
     "lr_scheduler_type": "CosineAnnealingLR",
     "lr_scheduler": {
         "T_max": 200000,
-        "eta_min": 1e-5
+        "eta_min": 1e-5,
+        "last_epoch": -1
     },
     "seed": 131
 }

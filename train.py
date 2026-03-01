@@ -1,12 +1,11 @@
 import argparse
-import datetime
 import json
 import time
 import torch
 import torch.optim as optim
 import os
 from torch.backends import cudnn
-from agent.loss import HalftoneMARLLoss, TotalHalftoneLoss
+from agent.loss import le_gradient_estimator, anisotropy_suppression_loss
 from utils.logger import setup_logging
 from utils.dataset import get_dataloader
 from utils.util import ensure_dir, save_list, tensor2array, save_images_from_batch
@@ -44,18 +43,18 @@ class Trainer:
         self.lr_scheduler = getattr(optim.lr_scheduler, config['lr_scheduler_type'])(self.optimizer, **config['lr_scheduler'])
 
         ## dataset loader
-        self.train_data_loader = get_dataloader(self.config, train=True)
+        self.train_data_loader = get_dataloader(self.config, dtype='train')
+        self.val_data_loader = get_dataloader(self.config, dtype='val')
         self.logger.info("Training samples: %d", len(self.train_data_loader.dataset))
 
 
         # 混合精度训练
         self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
 
-        self.total_loss_fn = TotalHalftoneLoss(ws=0.06, wa=0.002)
-
         if self.resume_path:
             assert os.path.exists(self.resume_path), 'Invalid checkpoint Path: %s' % self.resume_path
             self.load_checkpoint(self.resume_path)
+
 
     def _train(self):
         torch.manual_seed(self.seed)
@@ -72,8 +71,7 @@ class Trainer:
             self.lr_scheduler.step()
             epoch_lr = self.optimizer.state_dict()['param_groups'][0]['lr']
             epoch_metric = self._valid_epoch(epoch)
-            self.logger.info("[*] --- epoch: %d/%d | loss: %4.4f | metric: %4.4f | time-consumed: %4.2fs ---", epoch + 1, self.n_epochs, epoch_loss['total_loss'], epoch_metric, time.time() - ep_st)
-
+            self.logger.info("[*] --- epoch: %d/%d | loss: %4.4f | metric: %4.4f | lr: %4f | time-consumed: %4.2fs ---", epoch + 1, self.n_epochs, epoch_loss['total_loss'], epoch_metric, epoch_lr, time.time() - ep_st)
             # save losses and learning rate
             epoch_loss['metric'] = epoch_metric
             epoch_loss['lr'] = epoch_lr
@@ -85,8 +83,6 @@ class Trainer:
                 self.logger.info("---------- saving best model ...")
                 self.monitor_best = epoch_metric
                 self.save_checkpoint(epoch, save_best=True)
-
-            self.train_data_loader = get_dataloader(self.config, train=True)
 
         self.logger.info("Training finished! consumed %f sec", time.time() - start_time)
 
@@ -110,7 +106,9 @@ class Trainer:
                 prob_cg = self.model(cg, zg)  # 恒定灰度图的输出 (B,1,H,W)
 
                 # 计算损失
-                total_loss, marl_loss, las_loss = self.total_loss_fn(prob, c, z, prob_cg)
+                marl_loss = le_gradient_estimator(c, prob)
+                las_loss = anisotropy_suppression_loss(prob_cg)
+                total_loss = marl_loss + 0.002 * las_loss
 
             # 反向传播
             self.optimizer.zero_grad()
@@ -142,19 +140,23 @@ class Trainer:
         self.model.eval()
         total_loss = 0
         with torch.no_grad():
-            for batch_idx, (c, _) in enumerate(self.train_data_loader):
-                c = c.to(self.device)
-                z = torch.randn_like(c) * 0.3
-                prob = self.model(c, z)  # 网络原始输出 (B,1,H,W)
+            for batch_idx, (c, _) in enumerate(self.val_data_loader):
+                with torch.amp.autocast('cuda', enabled=self.use_amp):
+                    c = c.to(self.device)
+                    z = torch.randn_like(c) * 0.3
+                    prob = self.model(c, z)  # 网络原始输出 (B,1,H,W)
 
-                B, C, H, W = c.shape
-                cg = torch.rand(B, C, H, W).uniform_(0, 1).to(self.device)  # 恒定灰度图
-                zg = torch.randn(B, C, H, W).to(self.device)
-                prob_cg = self.model(cg, zg)  # 恒定灰度图的输出 (B,1,H,W)
+                    B, C, H, W = c.shape
+                    cg = torch.rand(B, C, H, W).uniform_(0, 1).to(self.device)  # 恒定灰度图
+                    zg = torch.randn(B, C, H, W).to(self.device)
+                    prob_cg = self.model(cg, zg)  # 恒定灰度图的输出 (B,1,H,W)
 
-                # 计算损失
-                loss, marl_loss, las_loss = self.total_loss_fn(prob, c, z, prob_cg)
-                total_loss += loss.item()
+                    # 计算损失
+                    marl_loss = le_gradient_estimator(c, prob)
+                    las_loss = anisotropy_suppression_loss(prob_cg)
+                    loss = marl_loss + 0.002 * las_loss
+                    total_loss += loss.item()
+                    self.logger.info("Validation: [%d/%d] iter:%d marl_loss:%4.4f las_loss:%4.4f total_loss:%4.4f " % (epoch + 1, self.n_epochs, batch_idx + 1, marl_loss.item(), las_loss.item(), loss.item()))
 
                 h = (prob > 0.5).float()
                 h_imgs = tensor2array(h)

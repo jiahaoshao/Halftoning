@@ -11,7 +11,7 @@ from utils.dataset import get_dataloader
 from utils.util import ensure_dir, save_list, tensor2array, save_images_from_batch
 from agent.model import HalftoningPolicyNet
 
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 class Trainer:
     def __init__(self, config, resume):
@@ -106,7 +106,7 @@ class Trainer:
                 prob_cg = self.model(cg, zg)  # 恒定灰度图的输出 (B,1,H,W)
 
                 # 计算损失
-                marl_loss = le_gradient_estimator(c, prob)
+                marl_loss, grad_norm = le_gradient_estimator(c, prob)
                 las_loss = anisotropy_suppression_loss(prob_cg)
                 total_loss = marl_loss + 0.002 * las_loss
 
@@ -152,7 +152,7 @@ class Trainer:
                     prob_cg = self.model(cg, zg)  # 恒定灰度图的输出 (B,1,H,W)
 
                     # 计算损失
-                    marl_loss = le_gradient_estimator(c, prob)
+                    marl_loss, grad_norm = le_gradient_estimator(c, prob)
                     las_loss = anisotropy_suppression_loss(prob_cg)
                     loss = marl_loss + 0.002 * las_loss
                     total_loss += loss.item()

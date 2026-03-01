@@ -44,22 +44,12 @@ class Trainer:
         self.lr_scheduler = getattr(optim.lr_scheduler, config['lr_scheduler_type'])(self.optimizer, **config['lr_scheduler'])
 
         ## dataset loader
-        self.train_data_loader = get_dataloader(config, train=True)
+        self.train_data_loader = get_dataloader(self.config, train=True)
         self.logger.info("Training samples: %d", len(self.train_data_loader.dataset))
 
-        ##
 
         # 混合精度训练
         self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
-
-        # HVS核
-        # self.hvs_kernel = gaussian_kernel(size=11, sigma=1.5).to(self.device)  # (11,11)
-
-        # 奖励计算器
-        # self.reward_calc = RewardCalculator(self.hvs_kernel, w_s=config['w_s'])
-
-        # 损失函数
-        # self.marl_loss_fn = HalftoneMARLLoss(self.reward_calc)
 
         self.total_loss_fn = TotalHalftoneLoss(ws=0.06, wa=0.002)
 
@@ -79,8 +69,8 @@ class Trainer:
             ep_st = time.time()
             epoch_loss = self._train_epoch(epoch)
             # perform lr_scheduler
-            epoch_lr = self.optimizer.state_dict()['param_groups'][0]['lr']
             self.lr_scheduler.step()
+            epoch_lr = self.optimizer.state_dict()['param_groups'][0]['lr']
             epoch_metric = self._valid_epoch(epoch)
             self.logger.info("[*] --- epoch: %d/%d | loss: %4.4f | metric: %4.4f | time-consumed: %4.2fs ---", epoch + 1, self.n_epochs, epoch_loss['total_loss'], epoch_metric, time.time() - ep_st)
 
@@ -95,6 +85,8 @@ class Trainer:
                 self.logger.info("---------- saving best model ...")
                 self.monitor_best = epoch_metric
                 self.save_checkpoint(epoch, save_best=True)
+
+            self.train_data_loader = get_dataloader(self.config, train=True)
 
         self.logger.info("Training finished! consumed %f sec", time.time() - start_time)
 
@@ -120,23 +112,23 @@ class Trainer:
                 # 计算损失
                 total_loss, marl_loss, las_loss = self.total_loss_fn(prob, c, z, prob_cg)
 
-                # 反向传播
-                self.optimizer.zero_grad()
-                if self.use_amp:
-                    self.scaler.scale(total_loss).backward()
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
-                    total_loss.backward()
-                    self.optimizer.step()
+            # 反向传播
+            self.optimizer.zero_grad()
+            if self.use_amp:
+                self.scaler.scale(total_loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                total_loss.backward()
+                self.optimizer.step()
 
-                # 记录损失
-                epoch_marl_loss += marl_loss.item()
-                epoch_las_loss += las_loss.item()
-                epoch_total_loss += total_loss.item()
+            # 记录损失
+            epoch_marl_loss += marl_loss.item()
+            epoch_las_loss += las_loss.item()
+            epoch_total_loss += total_loss.item()
 
-                if batch_idx % self.save_freq == 0:
-                    self.logger.info("[%d/%d] iter:%d loss:%4.4f ", epoch + 1, self.n_epochs, batch_idx + 1, total_loss.item())
+            if batch_idx % self.save_freq == 0:
+                self.logger.info("[%d/%d] iter:%d loss:%4.4f ", epoch + 1, self.n_epochs, batch_idx + 1, total_loss.item())
 
         epoch_loss = dict()
         epoch_loss['marl_loss'] = epoch_marl_loss / len(self.train_data_loader)

@@ -10,7 +10,7 @@
         "use_amp": true
     },
     "data_loader": {
-        "num_images": 640,
+        "num_images": 64,
         "crop_size": 64,
         "batch_size": 64,
         "shuffle": true,

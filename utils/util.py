@@ -53,7 +53,7 @@ def save_images_from_batch(img_batch, save_dir, filename_list, batch_no=-1):
         #! single-channel gray image
         for i in range(N):
             # [-1,1] >>> [0,255]
-            img_batch_i = np.clip(img_batch[i,:,:,0]*0.5+0.5, 0, 1)
+            img_batch_i = np.clip(img_batch[i,:,:,0], 0, 1)
             image = (255.0*img_batch_i).astype(np.uint8)
             save_name = filename_list[i] if batch_no==-1 else '%05d.png' % (batch_no*img_batch.shape[0]+i)
             imageio.imwrite(os.path.join(save_dir, save_name), image)

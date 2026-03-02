@@ -97,13 +97,11 @@ class Trainer:
             # 混合精度上下文
             with torch.amp.autocast('cuda', enabled=self.use_amp):
                 c = c.to(self.device)
-                z = torch.randn_like(c) * 0.3
-                prob = self.model(c, z)  # 网络原始输出 (B,1,H,W)
+                prob = self.model(c)  # 网络原始输出 (B,1,H,W)
 
                 B, C, H, W = c.shape
                 cg = torch.rand(B, C, H, W).uniform_(0, 1).to(self.device)  # 恒定灰度图
-                zg = torch.randn(B, C, H, W).to(self.device)
-                prob_cg = self.model(cg, zg)  # 恒定灰度图的输出 (B,1,H,W)
+                prob_cg = self.model(cg)  # 恒定灰度图的输出 (B,1,H,W)
 
                 # 计算损失
                 marl_loss, grad_norm = le_gradient_estimator(c, prob)
@@ -125,7 +123,7 @@ class Trainer:
             epoch_las_loss += las_loss.item()
             epoch_total_loss += total_loss.item()
 
-            if batch_idx % self.save_freq == 0:
+            if batch_idx % 10 == 0:
                 self.logger.info("[%d/%d] iter:%d loss:%4.4f ", epoch + 1, self.n_epochs, batch_idx + 1, total_loss.item())
 
         epoch_loss = dict()
@@ -143,13 +141,11 @@ class Trainer:
             for batch_idx, (c, _) in enumerate(self.val_data_loader):
                 with torch.amp.autocast('cuda', enabled=self.use_amp):
                     c = c.to(self.device)
-                    z = torch.randn_like(c) * 0.3
-                    prob = self.model(c, z)  # 网络原始输出 (B,1,H,W)
+                    prob = self.model(c)  # 网络原始输出 (B,1,H,W)
 
                     B, C, H, W = c.shape
                     cg = torch.rand(B, C, H, W).uniform_(0, 1).to(self.device)  # 恒定灰度图
-                    zg = torch.randn(B, C, H, W).to(self.device)
-                    prob_cg = self.model(cg, zg)  # 恒定灰度图的输出 (B,1,H,W)
+                    prob_cg = self.model(cg)  # 恒定灰度图的输出 (B,1,H,W)
 
                     # 计算损失
                     marl_loss, grad_norm = le_gradient_estimator(c, prob)
@@ -176,11 +172,13 @@ class Trainer:
 
     def load_checkpoint(self, checkpt_path):
         print("-loading checkpoint from: {} ...".format(checkpt_path))
-        checkpoint = torch.load(checkpt_path)
+        checkpoint = torch.load(checkpt_path, map_location=self.device)
         self.start_epoch = checkpoint['epoch'] + 1
         self.monitor_best = checkpoint['monitor_best']
         self.model.load_state_dict(checkpoint['state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
+        if 'scaler' in checkpoint and self.use_amp:
+            self.scaler.load_state_dict(checkpoint['scaler'])
         print("-pretrained checkpoint loaded.")
 
     def save_checkpoint(self, epoch, save_best=False):
@@ -188,7 +186,8 @@ class Trainer:
             'epoch': epoch,
             'state_dict': self.model.state_dict(),
             'optimizer': self.optimizer.state_dict(),
-            'monitor_best': self.monitor_best
+            'monitor_best': self.monitor_best,
+            'scaler': self.scaler.state_dict() if self.use_amp else None  # 保存scaler
         }
         save_path = os.path.join(self.checkpoint_dir, 'model_last.pth.tar')
         if save_best:

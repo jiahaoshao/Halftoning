@@ -62,7 +62,7 @@ class Inferencer:
                     # 映射回 0-255 并转为 uint8
                     ht_img = (ht_tensor * 255).astype(np.uint8)
 
-                    save_name = os.path.splitext(filename)[0] + '_halftone.png'
+                    save_name = os.path.splitext(filename)[0] + '_halftone.jpg'
                     save_path = os.path.join(save_dir, save_name)
                     cv2.imwrite(save_path, ht_img)
                     print(f"[{i * dataloader.batch_size + j + 1}/{len(dataloader.dataset)}] Saved: {save_path}")
@@ -74,8 +74,6 @@ if __name__ == '__main__':
                         help='config file path (default: None)')
     parser.add_argument('--model', default=None, type=str,
                         help='model weight file path')
-    parser.add_argument('--data_dir', default=None, type=str,
-                        help='where to load input data (RGB images)')
     parser.add_argument('--save_dir', default=None, type=str,
                         help='where to save the result')
     args = parser.parse_args()

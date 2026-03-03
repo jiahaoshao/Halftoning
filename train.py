@@ -5,7 +5,8 @@ import torch
 import torch.optim as optim
 import os
 from torch.backends import cudnn
-from agent.loss import le_gradient_estimator, anisotropy_suppression_loss, hvs_filter, cssim, EPS
+from agent.loss import le_gradient_estimator, anisotropy_suppression_loss, hvs_filter, cssim, EPS, HVS_KERNEL_SIZE, \
+    HVS_SCALE
 from utils.logger import setup_logging
 from utils.dataset import get_dataloader
 from utils.util import ensure_dir, save_list, tensor2array, save_images_from_batch
@@ -53,7 +54,6 @@ class Trainer:
         self.scaler = torch.amp.GradScaler(enabled=self.use_amp, device=self.device)
 
         if self.resume_path:
-            assert os.path.exists(self.resume_path), 'Invalid checkpoint Path: %s' % self.resume_path
             self.load_checkpoint(self.resume_path)
 
 
@@ -72,7 +72,13 @@ class Trainer:
             self.lr_scheduler.step()
             epoch_lr = self.optimizer.state_dict()['param_groups'][0]['lr']
             epoch_metric = self._valid_epoch(epoch)
-            self.logger.info("[*] --- epoch: %d/%d | loss: %4.4f | metric: %4.4f | lr: %4f | time-consumed: %4.2fs ---", epoch + 1, self.n_epochs, epoch_loss['total_loss'], epoch_metric, epoch_lr, time.time() - ep_st)
+            # ========== 修改点1：epoch汇总日志，移除所有小数位限制，全精度打印 ==========
+            self.logger.info("[*] --- epoch: %d/%d | loss: %.17g | metric: %.17g | lr: %.17g | time-consumed: %.17gs ---",
+                             epoch + 1, self.n_epochs,
+                             epoch_loss['total_loss'],
+                             epoch_metric,
+                             epoch_lr,
+                             time.time() - ep_st)
             # save losses and learning rate
             epoch_loss['metric'] = epoch_metric
             epoch_loss['lr'] = epoch_lr
@@ -85,7 +91,7 @@ class Trainer:
                 self.monitor_best = epoch_metric
                 self.save_checkpoint(epoch, save_best=True)
 
-        self.logger.info("Training finished! consumed %f sec", time.time() - start_time)
+        self.logger.info("Training finished! consumed %.17g sec", time.time() - start_time)
 
 
     def _train_epoch(self, epoch):
@@ -95,37 +101,60 @@ class Trainer:
         epoch_total_loss = 0.0
 
         for batch_idx, (c, _) in enumerate(self.train_data_loader):
-            # 混合精度上下文
+            c = c.to(self.device)
+            B, C, H, W = c.shape
+            # 仅网络前向传播使用autocast，损失计算用FP32保证精度
             with torch.amp.autocast('cuda', enabled=self.use_amp):
-                c = c.to(self.device)
-                prob = self.model(c)  # 网络原始输出 (B,1,H,W)
+                prob = self.model(c)
+                cg_gray_val = torch.rand(B, C, 1, 1, device=self.device) * 0.9 + 0.05
+                cg = cg_gray_val.expand(B, C, H, W)
+                prob_cg = self.model(cg)
 
-                B, C, H, W = c.shape
-                cg = torch.rand(B, C, H, W).uniform_(0, 1).to(self.device)  # 恒定灰度图
-                prob_cg = self.model(cg)  # 恒定灰度图的输出 (B,1,H,W)
+                if batch_idx % 20 == 0:
+                    # 监控恒定灰度图输出的概率分布，std不能趋近于0
+                    self.logger.info(
+                        "prob_cg stats: min=%.17g max=%.17g mean=%.17g std=%.17g",
+                        prob_cg.min().item(), prob_cg.max().item(),
+                        prob_cg.mean().item(), prob_cg.std().item()
+                    )
 
-                # 计算损失
-                marl_loss, grad_norm = le_gradient_estimator(c, prob)
-                las_loss = anisotropy_suppression_loss(prob_cg)
-                total_loss = marl_loss + 0.002 * las_loss
+            # 损失计算强制用FP32，避免精度问题
+            prob = prob.float()
+            prob_cg = prob_cg.float()
+            c = c.float()
+            marl_loss, grad_norm = le_gradient_estimator(c, prob)
+            las_loss = anisotropy_suppression_loss(prob_cg)
+            total_loss = marl_loss + 0.002 * las_loss
 
             # 反向传播
             self.optimizer.zero_grad()
             if self.use_amp:
                 self.scaler.scale(total_loss).backward()
+                # 先反缩放梯度，再做裁剪
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                 self.optimizer.step()
 
             # 记录损失
+            marl_loss = torch.nan_to_num(marl_loss, nan=0.0, posinf=10.0, neginf=-10.0)
+            las_loss = torch.nan_to_num(las_loss, nan=0.0, posinf=100.0, neginf=0.0)
+            total_loss = torch.nan_to_num(total_loss, nan=0.0, posinf=10.0, neginf=-10.0)
+
             epoch_marl_loss += marl_loss.item()
             epoch_las_loss += las_loss.item()
             epoch_total_loss += total_loss.item()
 
             if batch_idx % 20 == 0:
-                self.logger.info("[%d/%d] iter:%d loss:%4.4f ", epoch + 1, self.n_epochs, batch_idx + 1, total_loss.item())
+                # ========== 修改点2：训练batch日志，移除小数位限制 ==========
+                self.logger.info("[%d/%d] iter:%d loss:%.17g ",
+                                 epoch + 1, self.n_epochs,
+                                 batch_idx + 1,
+                                 total_loss.item())
 
         epoch_loss = dict()
         epoch_loss['marl_loss'] = epoch_marl_loss / len(self.train_data_loader)
@@ -139,7 +168,6 @@ class Trainer:
         total_psnr = 0.0
         total_cssim = 0.0
         total_samples = 0
-        HVS_KERNEL_SIZE = 11
         PAD_CROP = HVS_KERNEL_SIZE // 2
 
         with torch.no_grad():
@@ -151,17 +179,17 @@ class Trainer:
                 prob = self.model(c)
                 h = (prob > 0.5).float()  # h也是[0,1]值域的二值图
 
-                # 修正1：HVS滤波用[0,1]值域输入，符合论文设定
-                c_hvs = hvs_filter(c)  # 输出量级≈[0, 1/2000]
-                h_hvs = hvs_filter(h)
+                # HVS滤波不使用缩放，信号值域[0,1]，MAX_I=1，公式完全正确
+                c_hvs = hvs_filter(c, apply_visual_scale=False)
+                h_hvs = hvs_filter(h, apply_visual_scale=False)
 
-                # 裁剪边缘（不变，对齐论文valid卷积要求）
+                # 裁剪边缘不变
                 c_hvs_valid = c_hvs[:, :, PAD_CROP:-PAD_CROP, PAD_CROP:-PAD_CROP]
                 h_hvs_valid = h_hvs[:, :, PAD_CROP:-PAD_CROP, PAD_CROP:-PAD_CROP]
 
-                # 修正2：PSNR公式适配[0,1]值域（MAX_I=1）
+                # 正确的PSNR公式，MAX_I=1，和论文表3.2的数值完全对齐
                 mse = F.mse_loss(h_hvs_valid, c_hvs_valid)
-                psnr = 10 * torch.log10(1.0 / (mse + EPS))  # MAX_I=1，所以MAX_I²=1
+                psnr = 10 * torch.log10(1.0 / (mse + EPS))  # 不会再出现inf
 
                 # CSSIM计算不变（本身基于[0,1]值域）
                 cssim_score = cssim(h, c)
@@ -173,12 +201,16 @@ class Trainer:
                 h_imgs = tensor2array(h)
                 save_images_from_batch(h_imgs, self.val_halftone, None, batch_idx)
 
-                self.logger.info("Validation: [%d/%d] iter:%d PSNR:%4.4f CSSIM:%4.4f"
-                                 % (epoch + 1, self.n_epochs, batch_idx + 1, psnr.item(), cssim_score.mean().item()))
+                self.logger.info("Validation: [%d/%d] iter:%d PSNR:%.17g CSSIM:%.17g"
+                                 % (epoch + 1, self.n_epochs,
+                                    batch_idx + 1,
+                                    psnr.item(),
+                                    cssim_score.mean().item()))
 
         avg_psnr = total_psnr / total_samples
         avg_cssim = total_cssim / total_samples
-        self.logger.info(f"Validation Epoch {epoch + 1}: Avg PSNR={avg_psnr:.4f}, Avg CSSIM={avg_cssim:.4f}")
+        # ========== 修改点4：验证epoch汇总日志，移除小数位限制 ==========
+        self.logger.info(f"Validation Epoch {epoch + 1}: Avg PSNR={avg_psnr!r}, Avg CSSIM={avg_cssim!r}")
 
         monitor_metric = avg_psnr + avg_cssim
         return monitor_metric

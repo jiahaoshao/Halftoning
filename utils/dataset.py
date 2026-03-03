@@ -49,5 +49,5 @@ def get_dataloader(config, dtype='train'):
     else:
         dataloader = DataLoader(dataset, batch_size=config['data_loader']['batch_size'],
                                 shuffle=config['data_loader']['shuffle'], num_workers=config['data_loader']['num_workers'],
-                                pin_memory=True, persistent_workers=True, prefetch_factor=2)
+                                pin_memory=True, persistent_workers=True, prefetch_factor=2, multiprocessing_context='spawn')
     return dataloader

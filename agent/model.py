@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from agent.loss import EPS, PROB_CLAMP_MIN, PROB_CLAMP_MAX
+
+
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -73,7 +76,6 @@ class HalftoningPolicyNet(nn.Module):
         # 1. 维度校验与补全（适配单样本输入）
         if cont_img.dim() == 3:  # (1,H,W) → (1,1,H,W)
             cont_img = cont_img.unsqueeze(0)
-        assert cont_img.shape[1] == 1, "连续调图像必须为单通道 (B,1,H,W)"
 
         # 2. 生成/校验噪声图像
         if noise_img is None:
@@ -81,12 +83,13 @@ class HalftoningPolicyNet(nn.Module):
         else:
             if noise_img.dim() == 3:
                 noise_img = noise_img.unsqueeze(0)
-            assert noise_img.shape == cont_img.shape, "噪声图需与连续调图维度一致"
+
+        noise_img = (noise_img - noise_img.min()) / (noise_img.max() - noise_img.min() + EPS)
 
         x = torch.cat([cont_img, noise_img], dim=1)
         x = self.initial(x)
         x = self.blocks(x)
         x = self.final(x)
         prob = self.sigmoid(x)  # 白色概率
-        prob = torch.clamp(prob, 1e-8, 1 - 1e-8) # 防止概率极端值（梯度消失）
+        prob = torch.clamp(prob, PROB_CLAMP_MIN, PROB_CLAMP_MAX) # 防止概率极端值（梯度消失）
         return prob

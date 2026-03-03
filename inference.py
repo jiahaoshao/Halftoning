@@ -47,8 +47,6 @@ class Inferencer:
                 imgs = imgs
 
                 # 模型推理
-                # 注意：训练时有 noise_std=0.3，推理时通常保持一致或设为0，这里使用默认逻辑
-                # forward(self, cont_img, noise_img=None, noise_std=0.3)
                 prob = self.model(imgs)
 
                 # 二值化处理

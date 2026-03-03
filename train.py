@@ -5,13 +5,14 @@ import torch
 import torch.optim as optim
 import os
 from torch.backends import cudnn
-from agent.loss import le_gradient_estimator, anisotropy_suppression_loss
+from agent.loss import le_gradient_estimator, anisotropy_suppression_loss, hvs_filter, cssim, EPS
 from utils.logger import setup_logging
 from utils.dataset import get_dataloader
 from utils.util import ensure_dir, save_list, tensor2array, save_images_from_batch
+import torch.nn.functional as F
 from agent.model import HalftoningPolicyNet
 
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+# os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 class Trainer:
     def __init__(self, config, resume):
@@ -49,7 +50,7 @@ class Trainer:
 
 
         # 混合精度训练
-        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
+        self.scaler = torch.amp.GradScaler(enabled=self.use_amp, device=self.device)
 
         if self.resume_path:
             assert os.path.exists(self.resume_path), 'Invalid checkpoint Path: %s' % self.resume_path
@@ -62,7 +63,7 @@ class Trainer:
         cudnn.benchmark = True
 
         start_time = time.time()
-        self.monitor_best = 999.0
+        self.monitor_best = -float('inf')
 
         for epoch in range(self.start_epoch, self.n_epochs + 1):
             ep_st = time.time()
@@ -79,7 +80,7 @@ class Trainer:
             if (epoch+1) % self.save_freq == 0 or epoch == (self.n_epochs-1):
                 self.logger.info("---------- saving model ...")
                 self.save_checkpoint(epoch)
-            if self.monitor_best > epoch_metric:
+            if self.monitor_best < epoch_metric:
                 self.logger.info("---------- saving best model ...")
                 self.monitor_best = epoch_metric
                 self.save_checkpoint(epoch, save_best=True)
@@ -123,7 +124,7 @@ class Trainer:
             epoch_las_loss += las_loss.item()
             epoch_total_loss += total_loss.item()
 
-            if batch_idx % 10 == 0:
+            if batch_idx % 20 == 0:
                 self.logger.info("[%d/%d] iter:%d loss:%4.4f ", epoch + 1, self.n_epochs, batch_idx + 1, total_loss.item())
 
         epoch_loss = dict()
@@ -133,34 +134,54 @@ class Trainer:
 
         return epoch_loss
 
-
     def _valid_epoch(self, epoch):
         self.model.eval()
-        total_loss = 0
+        total_psnr = 0.0
+        total_cssim = 0.0
+        total_samples = 0
+        HVS_KERNEL_SIZE = 11
+        PAD_CROP = HVS_KERNEL_SIZE // 2
+
         with torch.no_grad():
             for batch_idx, (c, _) in enumerate(self.val_data_loader):
-                with torch.amp.autocast('cuda', enabled=self.use_amp):
-                    c = c.to(self.device)
-                    prob = self.model(c)  # 网络原始输出 (B,1,H,W)
+                c = c.to(self.device)  # c本身就是[0,1]值域，无需转255
+                B, C, H, W = c.shape
+                total_samples += B
 
-                    B, C, H, W = c.shape
-                    cg = torch.rand(B, C, H, W).uniform_(0, 1).to(self.device)  # 恒定灰度图
-                    prob_cg = self.model(cg)  # 恒定灰度图的输出 (B,1,H,W)
+                prob = self.model(c)
+                h = (prob > 0.5).float()  # h也是[0,1]值域的二值图
 
-                    # 计算损失
-                    marl_loss, grad_norm = le_gradient_estimator(c, prob)
-                    las_loss = anisotropy_suppression_loss(prob_cg)
-                    loss = marl_loss + 0.002 * las_loss
-                    total_loss += loss.item()
-                    self.logger.info("Validation: [%d/%d] iter:%d marl_loss:%4.4f las_loss:%4.4f total_loss:%4.4f " % (epoch + 1, self.n_epochs, batch_idx + 1, marl_loss.item(), las_loss.item(), loss.item()))
+                # 修正1：HVS滤波用[0,1]值域输入，符合论文设定
+                c_hvs = hvs_filter(c)  # 输出量级≈[0, 1/2000]
+                h_hvs = hvs_filter(h)
 
-                h = (prob > 0.5).float()
+                # 裁剪边缘（不变，对齐论文valid卷积要求）
+                c_hvs_valid = c_hvs[:, :, PAD_CROP:-PAD_CROP, PAD_CROP:-PAD_CROP]
+                h_hvs_valid = h_hvs[:, :, PAD_CROP:-PAD_CROP, PAD_CROP:-PAD_CROP]
+
+                # 修正2：PSNR公式适配[0,1]值域（MAX_I=1）
+                mse = F.mse_loss(h_hvs_valid, c_hvs_valid)
+                psnr = 10 * torch.log10(1.0 / (mse + EPS))  # MAX_I=1，所以MAX_I²=1
+
+                # CSSIM计算不变（本身基于[0,1]值域）
+                cssim_score = cssim(h, c)
+
+                # 累加统计（不变）
+                total_psnr += psnr.item() * B
+                total_cssim += cssim_score.sum().item()
+
                 h_imgs = tensor2array(h)
                 save_images_from_batch(h_imgs, self.val_halftone, None, batch_idx)
 
-                self.logger.info("Validation: [%d/%d] iter:%d loss:%4.4f " % (epoch + 1, self.n_epochs, batch_idx + 1, loss.item()))
+                self.logger.info("Validation: [%d/%d] iter:%d PSNR:%4.4f CSSIM:%4.4f"
+                                 % (epoch + 1, self.n_epochs, batch_idx + 1, psnr.item(), cssim_score.mean().item()))
 
-            return total_loss
+        avg_psnr = total_psnr / total_samples
+        avg_cssim = total_cssim / total_samples
+        self.logger.info(f"Validation Epoch {epoch + 1}: Avg PSNR={avg_psnr:.4f}, Avg CSSIM={avg_cssim:.4f}")
+
+        monitor_metric = avg_psnr + avg_cssim
+        return monitor_metric
 
     def save_loss(self, epoch_loss, epoch):
         if epoch == 0:

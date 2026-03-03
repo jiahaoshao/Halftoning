@@ -13,6 +13,8 @@ HVS_SCALE = 2000
 CSSIM_C1 = 1e-4
 CSSIM_C2 = 9e-4
 EPS = 1e-8
+PIXEL_SCALE = 255.0
+HVS_SENSITIVITY = 2000
 
 
 # -------------------------- 1. 预计算复用模块（核心性能优化） --------------------------
@@ -29,34 +31,44 @@ HVS_KERNEL = create_gaussian_kernel()
 HVS_PADDING = HVS_KERNEL_SIZE // 2
 
 
-# -------------------------- 2. HVS滤波模块（严格对齐论文3.5节Näsänen HVS模型） --------------------------
+# loss.py 中重构hvs_filter
 def hvs_filter(x: torch.Tensor) -> torch.Tensor:
     """
-    单张图像HVS低通滤波，严格对齐论文3.5节
-    :param x: 输入张量 [B, C, H, W]
-    :return: HVS滤波后张量 [B, C, H, W]
+    严格对齐论文3.5节HVS模型：输入[0,1]值域，滤波后仅除以2000
+    :param x: 输入张量 [B, C, H, W]，值域必须是[0,1]
+    :return: HVS滤波后张量 [B, C, H, W]，值域≈[0, 1/2000]
     """
+    assert torch.all(x >= 0) and torch.all(x <= 1), "HVS输入必须归一化到[0,1]"
     x_filtered = F.conv2d(
         x, HVS_KERNEL,
         padding=HVS_PADDING,
         groups=x.shape[1]
     )
-    return x_filtered / HVS_SCALE
+    # 仅保留论文要求的/2000，移除错误的*PIXEL_SCALE
+    return x_filtered / HVS_SENSITIVITY
 
 
 def batch_hvs_filter(h_batch: torch.Tensor) -> torch.Tensor:
     """
-    批量半色调块HVS滤波，消除冗余参数，复用全局核
-    :param h_batch: 输入半色调块张量 [B, 1, H, W, N]（N=block_num）
-    :return: 滤波后张量 [B, 1, H, W, N]
+    批量HVS滤波，严格对齐单张hvs_filter逻辑（输入[0,1]值域，仅除以2000）
+    :param h_batch: 批量半色调张量 [B, C, H, W, N]
+    :return: 滤波后张量 [B, C, H, W, N]
     """
     B, C, H, W, N = h_batch.shape
-    # 向量化reshape，避免循环，充分利用GPU并行
+    # 维度重塑：[B, C, H, W, N] → [B*N, C, H, W]（批量并行计算）
     h_reshaped = h_batch.permute(0, 4, 1, 2, 3).reshape(B * N, C, H, W)
-    h_hvs = F.conv2d(h_reshaped, HVS_KERNEL, padding=HVS_PADDING, groups=C)
-    # 还原维度，保持和输入一致
+
+    # 修正：移除错误的255值域缩放，直接滤波+仅除以2000
+    h_hvs = F.conv2d(
+        h_reshaped, HVS_KERNEL,
+        padding=HVS_PADDING,
+        groups=C
+    )
+    h_hvs = h_hvs / HVS_SENSITIVITY  # 仅保留论文要求的/2000
+
+    # 还原维度：[B*N, C, H, W] → [B, C, H, W, N]
     h_hvs = h_hvs.reshape(B, N, C, H, W).permute(0, 2, 3, 4, 1)
-    return h_hvs / HVS_SCALE
+    return h_hvs
 
 
 # -------------------------- 3. CSSIM计算模块（严格对齐论文式3-23，消除循环，极致并行） --------------------------
@@ -129,6 +141,8 @@ def reward(h: torch.Tensor, c: torch.Tensor, w_s: float = 0.06) -> torch.Tensor:
     :return: 奖励值，维度与输入批量维度一致
     """
     is_batch_mode = (h.dim() == 5)
+    # 记录原始dtype，计算后还原（解决Half/Float不匹配）
+    orig_dtype = h.dtype
     if is_batch_mode:
         B, C, H, W, N = h.shape
         # 批量HVS滤波
@@ -145,16 +159,16 @@ def reward(h: torch.Tensor, c: torch.Tensor, w_s: float = 0.06) -> torch.Tensor:
         mse = torch.clamp(F.mse_loss(h_hvs, c_hvs, reduction='none').mean(dim=(1, 2, 3)), min=EPS)
         cssim_score = cssim(h, c)
 
-    # 论文式3-24核心公式
-    r = -mse + w_s * cssim_score
+    # 论文式3-24核心公式 + 还原原始dtype
+    r = (-mse + w_s * cssim_score).to(orig_dtype)
     # 数值裁剪，避免梯度爆炸
-    return torch.clamp(r, min=-1e2, max=1e2)
+    return torch.clamp(r, min=-1.0, max=0.1)
 
 
 # -------------------------- 5. 核心L_MARL损失计算（LE梯度估计器，100%对齐论文式3-14/3-15） --------------------------
 def le_gradient_estimator(
-        prob: torch.Tensor,
         c: torch.Tensor,
+        prob: torch.Tensor,
         w_s: float = 0.06,
         block_size: int = 64
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -231,9 +245,9 @@ def le_gradient_estimator(
         # 梯度项 = π0*r0 + π1*r1，和prob直接关联，保留完整梯度回传链路
         pi_0_block = prob_0[:, :, block_y, block_x]  # [B,1,block_num]
         pi_1_block = prob_1[:, :, block_y, block_x]  # [B,1,block_num]
-        block_gradient_term = pi_0_block * r_0 + pi_1_block * r_1
+        block_gradient_term = (pi_0_block * r_0 + pi_1_block * r_1).to(dtype)  # 强制对齐dtype
 
-        # 赋值回梯度项张量
+        # 赋值回梯度项张量（彻底解决Half/Float不匹配）
         gradient_term[:, :, block_y, block_x] = block_gradient_term
 
         # 显存清理：仅删除块级临时张量，不调用empty_cache（避免性能损耗）
@@ -251,48 +265,43 @@ def le_gradient_estimator(
     return loss_marl, grad_norm
 
 
-# -------------------------- 6. 各向异性抑制损失L_AS（优化版，对齐论文式3-19） --------------------------
 def anisotropy_suppression_loss(prob: torch.Tensor) -> torch.Tensor:
     """
-    各向异性抑制损失L_AS，优化版，对齐论文式3-19，全流程PyTorch实现，避免CPU/GPU数据搬运
+    各向异性抑制损失L_AS，优化版，对齐论文式3-19，批量向量化实现
+    修复：FFT计算时临时转为float32，避免ComplexHalf实验性警告
     :param prob: 策略网络输出的概率图π(h=1)，[B,1,H,W]
     :return: L_AS损失标量
     """
-    B, _, H, W = prob.shape
+    B, C, H, W = prob.shape
     device = prob.device
-    loss = 0.0
+    orig_dtype = prob.dtype  # 记录原始dtype
+    prob = prob.squeeze(1).to(torch.float32)  # 临时转float32，避免ComplexHalf
 
-    # 全流程PyTorch实现，避免CuPy和PyTorch的数据切换，保证梯度回传
-    prob = prob.squeeze(1).float()  # [B,H,W]
+    # 批量FFT计算，支持自动微分（float32下稳定无警告）
+    f = torch.fft.fft2(prob)
+    f_shift = torch.fft.fftshift(f)
+    # 论文式3-16 功率谱计算
+    P_hat = torch.abs(f_shift) ** 2 / (H * W)
+    P_hat = P_hat + EPS
 
-    # 预生成径向坐标r，全程复用
-    cx, cy = H // 2, W // 2
+    # 预生成径向坐标r，批量复用
+    cx, cy = W // 2, H // 2
     x = torch.arange(W, device=device).repeat(H, 1)
     y = torch.arange(H, device=device).unsqueeze(1).repeat(1, W)
     r = torch.sqrt((x - cx).float() ** 2 + (y - cy).float() ** 2).long()
     max_r = r.max().item()
 
-    for b in range(B):
-        # PyTorch原生FFT，支持自动微分，无数据搬运
-        f = torch.fft.fft2(prob[b])
-        f_shift = torch.fft.fftshift(f)
-        # 功率谱计算，论文式3-16
-        P_hat = torch.abs(f_shift) ** 2 / (H * W)
-        P_hat += EPS
+    # 向量化计算径向平均功率谱RAPSD，论文式3-17
+    P_rho = torch.zeros(B, max_r + 1, device=device, dtype=torch.float32)
+    for r_val in range(max_r + 1):
+        mask = (r == r_val)
+        if mask.sum() > 0:
+            P_rho[:, r_val] = P_hat[:, mask].mean(dim=1)
 
-        # 径向平均功率谱RAPSD，论文式3-17
-        P_rho = torch.zeros(max_r + 1, device=device, dtype=prob.dtype)
-        for r_val in range(max_r + 1):
-            mask = (r == r_val)
-            if mask.sum() > 0:
-                P_rho[r_val] = P_hat[mask].mean()
+    # 论文式3-19 损失计算
+    P_rho_expand = P_rho[:, r]  # [B,H,W]
+    loss = torch.sum((P_hat - P_rho_expand) ** 2, dim=(1, 2)).mean()
 
-        # 论文式3-19：L_AS = Σ( P_hat - P_rho(r) )²
-        P_rho_expand = P_rho[r]
-        loss_b = torch.sum((P_hat - P_rho_expand) ** 2)
-        loss += loss_b
-
-    loss = (loss / B).to(prob.dtype)
-    # 数值保护
-    loss = torch.nan_to_num(loss, nan=0.0, posinf=1e3, neginf=0.0)
+    # 数值保护 + 还原原始dtype（保证和输入类型一致）
+    loss = torch.nan_to_num(loss, nan=0.0, posinf=1e3, neginf=0.0).to(orig_dtype)
     return loss

@@ -68,7 +68,7 @@ class HalftoningPolicyNet(nn.Module):
                 nn.init.constant_(m.weight, 1.0)
                 nn.init.constant_(m.bias, 0.0)
 
-    def forward(self, cont_img, noise_img=None, noise_std=0.3):
+    def forward(self, cont_img, noise_img=None, noise_std=1.0):
         # 1. 维度校验与补全（适配单样本输入）
         if cont_img.dim() == 3:  # (1,H,W) → (1,1,H,W)
             cont_img = cont_img.unsqueeze(0)
@@ -86,7 +86,7 @@ class HalftoningPolicyNet(nn.Module):
         x = self.initial(x)
         x = self.blocks(x)
         x = self.final(x)
-        x = torch.tanh(x)
+        # x = torch.tanh(x)
         prob = self.sigmoid(x)  # 白色概率
         prob = torch.clamp(prob, 1e-8, 1 - 1e-8) # 防止概率极端值（梯度消失）
         return prob

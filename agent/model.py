@@ -27,9 +27,10 @@ class ResidualBlock(nn.Module):
 
     def forward(self, x):
         residual = x
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out = F.relu(out + residual)
+        # 预激活结构：BN→ReLU→Conv，更适配深层残差网络
+        out = self.conv1(F.relu(self.bn1(x)))
+        out = self.conv2(F.relu(self.bn2(out)))
+        out = out + residual  # 残差路径无激活，保证梯度畅通
         return out
 
 class HalftoningPolicyNet(nn.Module):
@@ -86,7 +87,6 @@ class HalftoningPolicyNet(nn.Module):
         x = self.initial(x)
         x = self.blocks(x)
         x = self.final(x)
-        # x = torch.tanh(x)
         prob = self.sigmoid(x)  # 白色概率
         prob = torch.clamp(prob, 1e-8, 1 - 1e-8) # 防止概率极端值（梯度消失）
         return prob

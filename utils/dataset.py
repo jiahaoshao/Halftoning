@@ -44,10 +44,10 @@ def get_dataloader(config, dtype='train'):
     if dtype == 'test':
         dataloader = DataLoader(dataset, batch_size=1,
                                 shuffle=config['data_loader']['shuffle'],
-                                num_workers=config['data_loader']['num_workers'],
-                                pin_memory=True, persistent_workers=True, prefetch_factor=2)
+                                num_workers=0,
+                                pin_memory=True)
     else:
         dataloader = DataLoader(dataset, batch_size=config['data_loader']['batch_size'],
                                 shuffle=config['data_loader']['shuffle'], num_workers=config['data_loader']['num_workers'],
-                                pin_memory=True, persistent_workers=False, prefetch_factor=2)
+                                pin_memory=True, persistent_workers=True, prefetch_factor=2)
     return dataloader

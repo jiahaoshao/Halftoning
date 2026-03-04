@@ -53,10 +53,12 @@ class Trainer:
         # 混合精度训练
         self.scaler = torch.amp.GradScaler(enabled=self.use_amp, device=self.device)
 
+        self.monitor_best = -float('inf')
+        self.loss_history = {}
+
         if self.resume_path:
             self.load_checkpoint(self.resume_path)
 
-        # ================== 新增：设备信息记录 Start ==================
         if self.with_cuda:
             current_device_idx = torch.cuda.current_device()
             gpu_name = torch.cuda.get_device_name(current_device_idx)
@@ -71,7 +73,6 @@ class Trainer:
         cudnn.benchmark = True
 
         start_time = time.time()
-        self.monitor_best = -float('inf')
 
         for epoch in range(self.start_epoch, self.n_epochs + 1):
             ep_st = time.time()
@@ -79,7 +80,8 @@ class Trainer:
             # perform lr_scheduler
             self.lr_scheduler.step()
             epoch_lr = self.optimizer.state_dict()['param_groups'][0]['lr']
-            epoch_metric = self._valid_epoch(epoch)
+            avg_psnr, avg_cssim = self._valid_epoch(epoch)
+            epoch_metric = avg_psnr + avg_cssim
             # ========== 修改点1：epoch汇总日志，移除所有小数位限制，全精度打印 ==========
             self.logger.info("[*] --- epoch: %d/%d | loss: %.17g | metric: %.17g | lr: %.17g | time-consumed: %.17gs ---",
                              epoch + 1, self.n_epochs,
@@ -88,9 +90,17 @@ class Trainer:
                              epoch_lr,
                              time.time() - ep_st)
             # save losses and learning rate
+            epoch_loss['psnr'] = avg_psnr
+            epoch_loss['cssim'] = avg_cssim
             epoch_loss['metric'] = epoch_metric
             epoch_loss['lr'] = epoch_lr
             self.save_loss(epoch_loss, epoch)
+
+            for key, val in epoch_loss.items():
+                if key not in self.loss_history:
+                    self.loss_history[key] = []
+                self.loss_history[key].append(val)
+
             if (epoch+1) % self.save_freq == 0 or epoch == (self.n_epochs-1):
                 self.logger.info("---------- saving model ...")
                 self.save_checkpoint(epoch)
@@ -220,8 +230,7 @@ class Trainer:
         # ========== 修改点4：验证epoch汇总日志，移除小数位限制 ==========
         self.logger.info(f"Validation Epoch {epoch + 1}: Avg PSNR={avg_psnr!r}, Avg CSSIM={avg_cssim!r}")
 
-        monitor_metric = avg_psnr + avg_cssim
-        return monitor_metric
+        return avg_psnr, avg_cssim
 
     def save_loss(self, epoch_loss, epoch):
         if epoch == 0:
@@ -240,6 +249,13 @@ class Trainer:
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         if 'scaler' in checkpoint and self.use_amp:
             self.scaler.load_state_dict(checkpoint['scaler'])
+
+        if 'loss_history' in checkpoint:
+            self.loss_history = checkpoint['loss_history']
+            print(f"-loaded loss history with {len(list(self.loss_history.values())[0])} epochs.")
+        else:
+            print("-no loss history found in checkpoint.")
+
         print("-pretrained checkpoint loaded.")
 
     def save_checkpoint(self, epoch, save_best=False):
@@ -248,7 +264,8 @@ class Trainer:
             'state_dict': self.model.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'monitor_best': self.monitor_best,
-            'scaler': self.scaler.state_dict() if self.use_amp else None  # 保存scaler
+            'scaler': self.scaler.state_dict() if self.use_amp else None,  # 保存scaler
+            'loss_history': self.loss_history
         }
         save_path = os.path.join(self.checkpoint_dir, 'model_last.pth.tar')
         if save_best:

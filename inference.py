@@ -60,7 +60,11 @@ class Inferencer:
                     # 映射回 0-255 并转为 uint8
                     ht_img = (ht_tensor * 255).astype(np.uint8)
 
-                    save_name = os.path.splitext(filename)[0] + '_halftone.jpg'
+                    base = os.path.splitext(os.path.basename(filename))[0]
+                    ext = os.path.splitext(filename)[1]
+                    if not ext:
+                        ext = '.jpg'
+                    save_name = f"{base}_halftone{ext}"
                     save_path = os.path.join(save_dir, save_name)
                     cv2.imwrite(save_path, ht_img)
                     print(f"[{i * dataloader.batch_size + j + 1}/{len(dataloader.dataset)}] Saved: {save_path}")

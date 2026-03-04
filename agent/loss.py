@@ -57,6 +57,7 @@ def get_precomputed_coords(H: int, W: int, device: torch.device):
     return coords
 
 # ====================== 【严格对齐浙大论文3.5节】HVS滤波核心实现 ======================
+
 def create_gaussian_kernel(
     kernel_size: int = HVS_KERNEL_SIZE,
     sigma: float = HVS_SIGMA
@@ -102,6 +103,7 @@ def hvs_filter(x: torch.Tensor, apply_visual_scale: bool = False) -> torch.Tenso
 
     return x_filtered
 
+
 def batch_hvs_filter(h_batch: torch.Tensor) -> torch.Tensor:
     """
     批量HVS滤波，严格对齐单张hvs_filter逻辑，全向量化并行，无循环
@@ -118,6 +120,7 @@ def batch_hvs_filter(h_batch: torch.Tensor) -> torch.Tensor:
     return h_hvs
 
 # ====================== 【严格对齐浙大论文3.5节】CSSIM计算模块 ======================
+
 def cssim(h: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
     """
     对比度加权SSIM（CSSIM），100%对齐浙大博士论文式3-21~3-23
@@ -184,6 +187,7 @@ def cssim(h: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
     # 空间维度平均，返回[B]维度
     return cssim_map.mean(dim=(1, 2, 3))
 
+
 def batch_cssim(h_batch: torch.Tensor, c_batch: torch.Tensor) -> torch.Tensor:
     """
     批量CSSIM计算，全向量化并行，严格对齐单张cssim逻辑，无循环
@@ -202,6 +206,7 @@ def batch_cssim(h_batch: torch.Tensor, c_batch: torch.Tensor) -> torch.Tensor:
     return cssim_score
 
 # ====================== 【严格对齐浙大论文式3-24】奖励函数 ======================
+
 def reward(h: torch.Tensor, c: torch.Tensor, w_s: float = REWARD_WS_DEFAULT) -> torch.Tensor:
     """
     严格对齐浙大博士论文式3-24：R(h,c) = -MSE(HVS(h), HVS(c)) + w_s·CSSIM(h,c)
@@ -234,6 +239,7 @@ def reward(h: torch.Tensor, c: torch.Tensor, w_s: float = REWARD_WS_DEFAULT) -> 
     return torch.clamp(r, min=-10.0, max=1.0)
 
 # ====================== 【完全重写，严格对齐浙大论文式3-14/3-15】LE梯度估计器 ======================
+
 def le_gradient_estimator(
         c: torch.Tensor,
         prob: torch.Tensor,
@@ -332,6 +338,7 @@ def le_gradient_estimator(
     return loss_marl, grad_norm
 
 # ====================== 【严格对齐浙大论文式3-18/3-19】各向异性抑制损失L_AS ======================
+
 def anisotropy_suppression_loss(prob: torch.Tensor) -> torch.Tensor:
     """
     修复后：严格对齐论文式3-19，归一化量级，排除直流分量，解决数值坍塌
@@ -383,32 +390,3 @@ def anisotropy_suppression_loss(prob: torch.Tensor) -> torch.Tensor:
     # 还原原始dtype，保证梯度回传链路完整
     loss = torch.nan_to_num(loss, nan=0.0, posinf=1e3, neginf=0.0).to(orig_dtype)
     return loss
-
-# ====================== 【严格对齐浙大论文式3-20】总损失计算 ======================
-def total_loss(
-        c: torch.Tensor,
-        prob: torch.Tensor,
-        constant_gray_prob: torch.Tensor,
-        w_s: float = REWARD_WS_DEFAULT,
-        w_a: float = LOSS_WA_DEFAULT,
-        block_size: int = 64
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    总损失计算，严格对齐浙大论文式3-20
-    论文核心公式：∇L_total = ∇L_MARL + w_a · ∇L_AS → L_total = L_MARL + w_a · L_AS
-    论文明确要求：L_AS仅对恒定灰度图的输出概率计算，不可用于真实图像
-    :param c: 真实连续调输入图像 [B, C, H, W]
-    :param prob: 真实图像对应的策略输出概率 [B, C, H, W]
-    :param constant_gray_prob: 恒定灰度图对应的策略输出概率 [B, C, H, W]，论文要求L_AS仅在此计算
-    :param w_s: 奖励函数权重，默认0.06
-    :param w_a: 各向异性损失权重，默认0.002
-    :param block_size: LE梯度估计器分块大小
-    :return: 总损失、L_MARL损失、L_AS损失，均为标量，可直接反向传播
-    """
-    # 计算L_MARL损失，严格对齐论文式3-15
-    loss_marl, grad_norm = le_gradient_estimator(c, prob, w_s, block_size)
-    # 计算L_AS损失，严格对齐论文式3-19，仅对恒定灰度图计算
-    loss_as = anisotropy_suppression_loss(constant_gray_prob)
-    # 论文式3-20 总损失计算，100%对齐
-    loss_total = loss_marl + w_a * loss_as
-    return loss_total, loss_marl, loss_as

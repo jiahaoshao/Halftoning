@@ -15,8 +15,8 @@ from agent.model import HalftoningPolicyNet
 
 # ====================== 【优化】CUDA底层配置，适配RTX5080 ======================
 # 1. 禁用Dynamo/Inductor（核心解决Triton断言错误）
-torch._dynamo.config.disable = True
-os.environ["TORCH_COMPILE_DISABLE"] = "1"  # 双重兜底
+torch._dynamo.config.disable = False
+os.environ["TORCH_COMPILE_DISABLE"] = "0"
 
 # 2. 适配RTX 5080的精度配置（统一用新版API）
 torch.backends.cuda.matmul.fp32_precision = "tf32"  # RTX 5080支持TF32，兼顾速度+精度
@@ -152,7 +152,7 @@ class Trainer:
                 cg = cg_gray_val.expand(B, C, H, W)
                 prob_cg = self.model(cg)
 
-                if batch_idx % 100 == 0:
+                if batch_idx % 50 == 0:
                     # 监控恒定灰度图输出的概率分布，std不能趋近于0
                     self.logger.info(
                         "prob_cg stats: min=%.17g max=%.17g mean=%.17g std=%.17g",
@@ -192,7 +192,7 @@ class Trainer:
             epoch_total_loss += total_loss.item()
 
             # 【优化】降低日志打印频率，减少阻塞
-            if batch_idx % 200 == 0:
+            if batch_idx % 50 == 0:
                 self.logger.info("[%d/%d] iter:%d loss:%.17g ",
                                  epoch + 1, self.n_epochs,
                                  batch_idx + 1,

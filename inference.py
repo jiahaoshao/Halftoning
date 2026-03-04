@@ -29,7 +29,14 @@ class Inferencer:
         # 移除 'module.' 前缀（如果是多卡训练保存的权重）
         new_state_dict = OrderedDict()
         for k, v in state_dict.items():
-            name = k[7:] if k.startswith('module.') else k
+            # 1. 移除 _orig_mod. 前缀（torch.compile导致）
+            if k.startswith('_orig_mod.'):
+                name = k[len('_orig_mod.'):]  # 截取 _orig_mod. 之后的部分
+            # 2. 移除 module. 前缀（多卡训练导致）
+            elif k.startswith('module.'):
+                name = k[7:]
+            else:
+                name = k
             new_state_dict[name] = v
 
         self.model = model

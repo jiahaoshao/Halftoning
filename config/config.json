@@ -2,8 +2,8 @@
     "name": "halftoning_dev",
     "model": "HalftoningPolicyNet",
 	"data_dir": "dataset/",
-    "train_data_dir": "dataset/HalftoneVOC2012/train",
-    "val_data_dir": "dataset/HalftoneVOC2012/val",
+    "train_data_dir": "dataset/HalftoneVOC2012/train_npy",
+    "val_data_dir": "dataset/HalftoneVOC2012/val_npy",
     "test_data_dir": "dataset/HalftoneVOC2012/test",
 	"save_dir": "./",
     "initial_ckpt": "halftoning_dev/model_last.pth.tar",
@@ -18,7 +18,7 @@
     "data_loader": {
         "batch_size": 64,
         "shuffle": true,
-        "num_workers": 8,
+        "num_workers": 2,
         "prefetch_factor": 8,
         "crop_size": 64
     },

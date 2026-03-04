@@ -1,9 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from agent.loss import EPS, PROB_CLAMP_MIN, PROB_CLAMP_MAX
-
 
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
@@ -76,17 +74,15 @@ class HalftoningPolicyNet(nn.Module):
         # 1. 维度校验与补全（适配单样本输入）
         if cont_img.dim() == 3:  # (1,H,W) → (1,1,H,W)
             cont_img = cont_img.unsqueeze(0)
-
         # 2. 生成/校验噪声图像
         if noise_img is None:
             noise_img = torch.randn_like(cont_img) * noise_std  # 与连续调图同尺寸的高斯噪声
         else:
             if noise_img.dim() == 3:
                 noise_img = noise_img.unsqueeze(0)
-
+        # 【优化】保证tensor内存连续，加速后续cat和卷积
         noise_img = (noise_img - noise_img.min()) / (noise_img.max() - noise_img.min() + EPS)
-
-        x = torch.cat([cont_img, noise_img], dim=1)
+        x = torch.cat([cont_img, noise_img], dim=1).contiguous()
         x = self.initial(x)
         x = self.blocks(x)
         x = self.final(x)

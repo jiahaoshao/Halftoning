@@ -10,24 +10,19 @@
     "trainer": {
         "epochs": 1000,
         "save_epochs": 1,
-        "use_amp": true
+        "val_epochs": 1,
+        "enable_compile": true,
+        "use_amp": true,
+        "compile_mode": "max-autotune"
     },
     "data_loader": {
         "batch_size": 64,
         "shuffle": true,
-        "num_workers": 16
+        "num_workers": 8,
+        "prefetch_factor": 8,
+        "crop_size": 64
     },
     "cuda": true,
-    "w_s": 0.06,
-    "w_a": 0.002,
-    "quantizeLoss": "binL1",
-    "quantizeLossWeight": 0.2,
-    "toneLoss": "gaussianL2",
-    "toneLossWeight": 0.6,
-    "structureLoss": "ssimLoss",
-    "structureLossWeight": 0.0,
-    "blueNoiseLossWeight": 0.3,
-    "featureLossWeight": 1.0,
     "optimizer_type": "Adam",
     "optimizer": {
         "lr": 3e-4,

@@ -7,11 +7,11 @@ from utils.util import ensure_dir
 
 # VOC2012数据集划分：训练集 13758 张，验证集 1683 张，测试集 1684 张
 # TEST_COUNT = 1684
-VAL_COUNT = 1683
-TRAIN_COUNT = 13758
+# VAL_COUNT = 1683
+# TRAIN_COUNT = 13758
 TEST_COUNT = 8
-# VAL_COUNT = 64
-# TRAIN_COUNT = 640
+VAL_COUNT = 64
+TRAIN_COUNT = 64
 
 img_dir = 'VOCdevkit/VOC2012/JPEGImages'
 

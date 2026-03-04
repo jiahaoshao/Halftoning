@@ -56,6 +56,14 @@ class Trainer:
         if self.resume_path:
             self.load_checkpoint(self.resume_path)
 
+        # ================== 新增：设备信息记录 Start ==================
+        if self.with_cuda:
+            current_device_idx = torch.cuda.current_device()
+            gpu_name = torch.cuda.get_device_name(current_device_idx)
+            self.logger.info(f"@Device: Using GPU [{current_device_idx}] - {gpu_name} *************")
+        else:
+            self.logger.info("@Device: Using CPU *************")
+
 
     def _train(self):
         torch.manual_seed(self.seed)
@@ -110,7 +118,7 @@ class Trainer:
                 cg = cg_gray_val.expand(B, C, H, W)
                 prob_cg = self.model(cg)
 
-                if batch_idx % 20 == 0:
+                if batch_idx % 100 == 0:
                     # 监控恒定灰度图输出的概率分布，std不能趋近于0
                     self.logger.info(
                         "prob_cg stats: min=%.17g max=%.17g mean=%.17g std=%.17g",
@@ -149,7 +157,7 @@ class Trainer:
             epoch_las_loss += las_loss.item()
             epoch_total_loss += total_loss.item()
 
-            if batch_idx % 20 == 0:
+            if batch_idx % 100 == 0:
                 # ========== 修改点2：训练batch日志，移除小数位限制 ==========
                 self.logger.info("[%d/%d] iter:%d loss:%.17g ",
                                  epoch + 1, self.n_epochs,

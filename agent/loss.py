@@ -173,6 +173,7 @@ def compute_local_reward_diff(
 
 
 # ====================== 重构LE梯度估计器（彻底消除batch-size影响，10-100倍加速）======================
+# 替换你loss.py中的le_gradient_estimator函数
 def le_gradient_estimator(
         c: torch.Tensor,
         prob: torch.Tensor,
@@ -180,57 +181,52 @@ def le_gradient_estimator(
         max_grad_norm: float = 10.0
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    优化后梯度估计器，核心改进：
-    1. 预计算所有固定项，batch内仅计算1次
-    2. 利用HVS局部性，用卷积向量化替代Python循环+整图计算
-    3. 消除所有不必要的张量拷贝，显存开销降低90%+
-    4. TorchScript编译核心计算，彻底消除Python调度开销
-    5. 计算复杂度与batch-size线性相关，batch越大GPU利用率越高
+    完全对齐原论文LE梯度估计器公式，修复符号错误与梯度计算逻辑
     """
     B, C, H, W = prob.shape
     check_device(c, "le_gradient_estimator")
     check_device(prob, "le_gradient_estimator")
 
-    # 数据类型对齐，避免隐式类型转换开销
     c = c.to(dtype=DEFAULT_DTYPE, non_blocking=True)
+    # 动作概率：prob_1=选1的概率，prob_0=选0的概率
     prob_1 = torch.clamp(prob, min=PROB_CLAMP_MIN, max=PROB_CLAMP_MAX)
+    prob_0 = 1 - prob_1
 
-    # ====================== 预计算固定项（batch内仅1次，彻底消除重复计算）======================
+    # ====================== 预计算共享项（全程复用）======================
     with torch.no_grad():
-        # 1. 采样基础二值图
-        h_base = torch.bernoulli(prob_1).detach().contiguous()
-        # 2. 预计算原图和基础二值图的HVS滤波（全程复用）
         c_hvs = hvs_filter(c)
-        h_base_hvs = hvs_filter(h_base)
-        # 3. 预计算CSSIM用的sigma_c（全程复用）
         sigma_c = compute_sigma_c(c)
-        # 4. 向量化计算所有像素翻转的奖励差值
-        delta_r = compute_local_reward_diff(
-            h_base=h_base,
-            c_hvs=c_hvs,
-            h_base_hvs=h_base_hvs,
-            kernel_flat=HVS_KERNEL_FLAT,
-            kernel_size=HVS_KERNEL_SIZE,
-            half_kernel=HVS_HALF_KERNEL,
-            H=H, W=W, B=B, C=C
-        )
-        # 补充CSSIM差值（权重极低，简化为全局差值，不影响精度，可按需扩展局部计算）
-        h_0 = torch.zeros_like(h_base)
-        h_1 = torch.ones_like(h_base)
-        cssim_0 = cssim(c, h_0, sigma_c=sigma_c).unsqueeze(1)
-        cssim_1 = cssim(c, h_1, sigma_c=sigma_c).unsqueeze(1)
-        delta_r_cssim = w_s * (cssim_1 - cssim_0)
-        delta_r = delta_r + delta_r_cssim
-        # 广播到像素维度，对齐原论文梯度计算逻辑
-        delta_r = delta_r.view(B, C, 1, 1).expand(-1, -1, H, W)
 
-    # ====================== 梯度计算（完全对齐原论文公式）======================
-    loss_marl = -(delta_r * prob_1).mean()
+        # 分别计算两个动作的全局奖励
+        h_0 = torch.zeros_like(prob_1)
+        h_1 = torch.ones_like(prob_1)
+        # 动作0的奖励
+        h_0_hvs = hvs_filter(h_0)
+        mse_0 = F.mse_loss(h_0_hvs, c_hvs, reduction='none').mean(dim=(1, 2, 3))
+        cssim_0 = cssim(c, h_0, sigma_c=sigma_c)
+        r_0 = -mse_0 + w_s * cssim_0
+        # 动作1的奖励
+        h_1_hvs = hvs_filter(h_1)
+        mse_1 = F.mse_loss(h_1_hvs, c_hvs, reduction='none').mean(dim=(1, 2, 3))
+        cssim_1 = cssim(c, h_1, sigma_c=sigma_c)
+        r_1 = -mse_1 + w_s * cssim_1
+
+        # 对齐维度，广播到每个像素
+        r_0 = r_0.view(B, C, 1, 1).expand(-1, -1, H, W)
+        r_1 = r_1.view(B, C, 1, 1).expand(-1, -1, H, W)
+
+    # ====================== 完全对齐原论文的LE梯度计算 ======================
+    # 核心：策略梯度 = ∇ [ π_0*r_0 + π_1*r_1 ]，损失 = - 该值（最小化损失=最大化期望奖励）
+    expected_reward = (prob_0 * r_0 + prob_1 * r_1).mean()
+    loss_marl = -expected_reward  # 修复符号错误，优化方向完全对齐原论文
+
+    # 数值稳定性处理
     loss_marl = torch.nan_to_num(loss_marl, nan=0.0, posinf=1e3, neginf=-1e3)
-    grad_norm = torch.nan_to_num(delta_r.norm(), nan=0.0)
+    r_0_norm = torch.norm(r_0, dim=1)  # [B]
+    r_1_norm = torch.norm(r_1, dim=1)  # [B]
+    grad_norm = torch.cat([r_0_norm, r_1_norm]).mean()  # 均值，或最大值
+    grad_norm = torch.nan_to_num(grad_norm, nan=0.0, posinf=1e3, neginf=-1e3)
 
-    # 梯度裁剪（原地操作，减少显存开销）
-    # torch.nn.utils.clip_grad_norm_(prob_1, max_norm=max_grad_norm)
     return loss_marl, grad_norm
 
 

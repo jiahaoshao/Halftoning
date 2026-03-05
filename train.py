@@ -59,7 +59,7 @@ class Trainer:
 
         # 策略网络初始化
         self.model = HalftoningPolicyNet().to(self.device)
-        self.compile_mode = config['trainer'].get('compile_mode', 'max-autotune')
+        self.compile_mode = config['trainer'].get('compile_mode', 'reduce-overhead')
         if config['trainer'].get('enable_compile', True):
             self.model = torch.compile(self.model, mode=self.compile_mode)
             self.logger.info(f"@Model: torch.compile enabled with mode={self.compile_mode} *************")
@@ -142,7 +142,6 @@ class Trainer:
     def _train_epoch(self, epoch):
         """单轮训练，消除强制同步阻塞"""
         self.model.train()
-        # ✅ 用GPU张量累加loss，避免每个batch同步
         epoch_marl_loss = torch.tensor(0.0, device=self.device)
         epoch_las_loss = torch.tensor(0.0, device=self.device)
         epoch_total_loss = torch.tensor(0.0, device=self.device)
@@ -155,12 +154,10 @@ class Trainer:
             # 网络前向传播，混合精度加速
             with torch.amp.autocast('cuda', enabled=self.use_amp):
                 prob = self.model(c)
-                # ✅ 修复batch_size，避免重编译
-                cg_gray_val = torch.rand(1, C, 1, 1, device=self.device) * 0.9 + 0.05
+                cg_gray_val = torch.rand(B, C, 1, 1, device=self.device) * 0.9 + 0.05
                 cg = cg_gray_val.expand(B, C, H, W)
                 prob_cg = self.model(cg)
 
-            # ✅ 仅在需要打印日志时，才执行.item()同步，其余时间不触发同步
             if batch_idx % self.log_freq == 0:
                 self.logger.info(
                     "prob_cg stats: min=%.17g max=%.17g mean=%.17g std=%.17g",
@@ -185,15 +182,15 @@ class Trainer:
             if self.use_amp:
                 self.scaler.scale(total_loss).backward()
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
                 self.optimizer.step()
 
-            # ✅ GPU端无同步累加loss，仅做detach，不触发CPU-GPU同步
+
             marl_loss = torch.nan_to_num(marl_loss.detach(), nan=0.0, posinf=10.0, neginf=-10.0)
             las_loss = torch.nan_to_num(las_loss.detach(), nan=0.0, posinf=100.0, neginf=0.0)
             total_loss = torch.nan_to_num(total_loss.detach(), nan=0.0, posinf=10.0, neginf=-10.0)
@@ -202,7 +199,6 @@ class Trainer:
             epoch_las_loss += las_loss
             epoch_total_loss += total_loss
 
-            # ✅ 仅日志打印时触发一次同步，其余batch不执行
             if batch_idx % self.log_freq == 0:
                 self.logger.info(
                     f"LE loss computed in {loss_ed - loss_st:.17g} sec, marl_loss={marl_loss.item():.17g}, grad_norm={grad_norm:.17g}")
@@ -211,7 +207,6 @@ class Trainer:
                                  batch_idx + 1,
                                  total_loss.item())
 
-        # ✅ epoch结束后，一次性同步到CPU，仅触发1次同步
         epoch_loss = dict()
         epoch_loss['marl_loss'] = (epoch_marl_loss / total_batch).item()
         epoch_loss['las_loss'] = (epoch_las_loss / total_batch).item()
@@ -261,17 +256,16 @@ class Trainer:
                 save_list(os.path.join(self.cache, key), [epoch_loss[key]], append_mode=True)
 
     def load_checkpoint(self, checkpt_path):
-        """断点续训，兼容torch.compile后的模型权重"""
+        """断点续训，新增lr_scheduler状态恢复"""
         self.logger.info("-loading checkpoint from: {} ...".format(checkpt_path))
         checkpoint = torch.load(checkpt_path, map_location=self.device, weights_only=False)
         self.start_epoch = checkpoint['epoch'] + 1
         self.monitor_best = checkpoint['monitor_best']
 
-        # 权重兼容处理
+        # 权重兼容处理（原有逻辑不变）
         state_dict = checkpoint['state_dict']
         model_is_compiled = hasattr(self.model, "_orig_mod")
         weight_has_prefix = list(state_dict.keys())[0].startswith('_orig_mod.')
-
         if model_is_compiled:
             target_model = self.model._orig_mod
             if weight_has_prefix:
@@ -283,15 +277,17 @@ class Trainer:
             target_model = self.model
             self.logger.info(f"-model is not compiled, load weights directly")
 
-        # 权重加载
         load_result = target_model.load_state_dict(state_dict, strict=False)
         if load_result.missing_keys:
             self.logger.warning(f"-missing keys: {load_result.missing_keys}")
         if load_result.unexpected_keys:
             self.logger.warning(f"-unexpected keys: {load_result.unexpected_keys}")
-
-        # 优化器与混合精度状态加载
         self.optimizer.load_state_dict(checkpoint['optimizer'])
+        if 'lr_scheduler' in checkpoint:
+            self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+            self.logger.info(f"-lr_scheduler state loaded, current step: {self.lr_scheduler.last_epoch}")
+        else:
+            self.logger.warning("-no lr_scheduler state found in checkpoint, scheduler will reset")
         if 'scaler' in checkpoint and self.use_amp:
             self.scaler.load_state_dict(checkpoint['scaler'])
         if 'loss_history' in checkpoint:
@@ -302,11 +298,12 @@ class Trainer:
         self.logger.info("-pretrained checkpoint loaded.")
 
     def save_checkpoint(self, epoch, save_best=False):
-        """模型保存"""
+        """模型保存，新增lr_scheduler状态保存"""
         state = {
             'epoch': epoch,
             'state_dict': self.model.state_dict(),
             'optimizer': self.optimizer.state_dict(),
+            'lr_scheduler': self.lr_scheduler.state_dict(),
             'monitor_best': self.monitor_best,
             'scaler': self.scaler.state_dict() if self.use_amp else None,
             'loss_history': self.loss_history
@@ -315,7 +312,6 @@ class Trainer:
         if save_best:
             save_path = os.path.join(self.checkpoint_dir, 'model_best.pth.tar')
         torch.save(state, save_path)
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Halftoning')
     parser.add_argument('-c', '--config', default=None, type=str,

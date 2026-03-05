@@ -73,22 +73,26 @@ class HalftoningPolicyNet(nn.Module):
                 nn.init.constant_(m.weight, 1.0)
                 nn.init.constant_(m.bias, 0.0)
 
+    # 替换model.py中forward函数的噪声处理部分
     def forward(self, cont_img, noise_img=None, noise_std=1.0):
-        # 1. 维度校验与补全（适配单样本输入）
-        if cont_img.dim() == 3:  # (1,H,W) → (1,1,H,W)
+        if cont_img.dim() == 3:
             cont_img = cont_img.unsqueeze(0)
-        # 2. 生成/校验噪声图像
+
         if noise_img is None:
-            noise_img = torch.randn_like(cont_img) * noise_std  # 与连续调图同尺寸的高斯噪声
+            noise_img = torch.randn_like(cont_img) * noise_std  # 不做0-1归一化
         else:
             if noise_img.dim() == 3:
                 noise_img = noise_img.unsqueeze(0)
-        # 【优化】保证tensor内存连续，加速后续cat和卷积
-        noise_img = (noise_img - noise_img.min()) / (noise_img.max() - noise_img.min() + EPS)
+            # 保证噪声和输入图像同设备、同维度
+            noise_img = noise_img.to(cont_img.device, non_blocking=True)
+
+        # 3. 拼接输入，保证内存连续
         x = torch.cat([cont_img, noise_img], dim=1).contiguous()
+
+        # 4. 前向传播
         x = self.initial(x)
         x = self.blocks(x)
         x = self.final(x)
-        prob = self.sigmoid(x)  # 白色概率
-        prob = torch.clamp(prob, PROB_CLAMP_MIN, PROB_CLAMP_MAX) # 防止概率极端值（梯度消失）
+        prob = self.sigmoid(x)
+        prob = torch.clamp(prob, PROB_CLAMP_MIN, PROB_CLAMP_MAX)
         return prob

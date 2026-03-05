@@ -17,7 +17,7 @@
         "compile_mode": "reduce-overhead"
     },
     "data_loader": {
-        "batch_size": 256,
+        "batch_size": 64,
         "shuffle": true,
         "num_workers": 8,
         "prefetch_factor": 8,
@@ -26,13 +26,13 @@
     "cuda": true,
     "optimizer_type": "Adam",
     "optimizer": {
-        "lr": 1.2e-3,
+        "lr": 3e-4,
         "weight_decay": 0,
         "fused": true
     },
     "lr_scheduler_type": "CosineAnnealingLR",
     "lr_scheduler": {
-        "T_max": 200000,
+        "T_max": 1000,
         "eta_min": 1e-5,
         "last_epoch": -1
     },

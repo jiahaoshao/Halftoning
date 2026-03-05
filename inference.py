@@ -1,15 +1,13 @@
 import json
+import subprocess
 
-import imageio
 import numpy as np
 import cv2
 import os, argparse
-from glob import glob
 
 import torch
 
 from agent.model import HalftoningPolicyNet
-from utils import util
 from collections import OrderedDict
 
 from utils.dataset import get_dataloader
@@ -96,3 +94,5 @@ if __name__ == '__main__':
     # 3. 初始化推理器并运行
     inferencer = Inferencer(args.model, model)
     inferencer.infer(test_data_loader, args.save_dir)
+    save_dir_abs = os.path.abspath(args.save_dir)
+    subprocess.run(['explorer', save_dir_abs], shell=True)

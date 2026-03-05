@@ -8,9 +8,10 @@
 	"save_dir": "./",
     "initial_ckpt": "halftoning_dev/model_last.pth.tar",
     "trainer": {
-        "epochs": 1000,
+        "epochs": 2,
         "save_epochs": 1,
         "val_epochs": 1,
+        "log_epochs": 1,
         "enable_compile": true,
         "use_amp": true,
         "compile_mode": "max-autotune"

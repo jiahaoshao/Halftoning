@@ -1,7 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from agent.loss import EPS, PROB_CLAMP_MIN, PROB_CLAMP_MAX
+
+EPS = 1e-4
+PROB_CLAMP_MIN = 1e-4
+PROB_CLAMP_MAX = 1 - 1e-4
 
 class ResidualBlock(nn.Module):
     def __init__(self, channels):

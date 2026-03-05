@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from typing import Tuple
 from functools import lru_cache
 
+from profilehooks import profile
+
 # ====================== 【100%来自两篇论文，无任何自定义超参数】全局常量 ======================
 # 设备自动适配
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -239,7 +241,7 @@ def reward(h: torch.Tensor, c: torch.Tensor, w_s: float = REWARD_WS_DEFAULT) -> 
     return torch.clamp(r, min=-10.0, max=1.0)
 
 # ====================== 【完全重写，严格对齐浙大论文式3-14/3-15】LE梯度估计器 ======================
-
+@profile
 def le_gradient_estimator(
         c: torch.Tensor,
         prob: torch.Tensor,
@@ -390,3 +392,9 @@ def anisotropy_suppression_loss(prob: torch.Tensor) -> torch.Tensor:
     # 还原原始dtype，保证梯度回传链路完整
     loss = torch.nan_to_num(loss, nan=0.0, posinf=1e3, neginf=0.0).to(orig_dtype)
     return loss
+
+def calculate_hvs_psnr(c: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+    c_hvs = hvs_filter(c)
+    h_hvs = hvs_filter(h)
+    mse = F.mse_loss(c_hvs, h_hvs)
+    return 10 * torch.log10(1.0 / (mse + EPS))

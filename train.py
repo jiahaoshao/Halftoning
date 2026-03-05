@@ -4,6 +4,8 @@ import time
 import torch
 import torch.optim as optim
 import os
+
+from profilehooks import profile
 from torch.backends import cudnn
 from agent.loss import le_gradient_estimator, anisotropy_suppression_loss, cssim, calculate_hvs_psnr
 from utils.logger import setup_logging
@@ -15,6 +17,12 @@ from agent.model import HalftoningPolicyNet
 # ====================== CUDA底层配置，适配RTX系列GPU ======================
 torch._dynamo.config.disable = False
 os.environ["TORCH_COMPILE_DISABLE"] = "0"
+# 新增：扩大编译缓存，避免缓存溢出触发重编译
+torch._dynamo.config.cache_size_limit = 128
+# 新增：禁用不必要的调试检查，降低CPU开销
+torch._dynamo.config.suppress_errors = True
+torch.autograd.set_detect_anomaly(False)
+
 # TF32精度配置，兼顾速度与精度，适配RTX系列GPU
 torch.backends.cuda.matmul.fp32_precision = "tf32"
 torch.backends.cudnn.fp32_precision = "tf32"
@@ -57,7 +65,7 @@ class Trainer:
             self.logger.info(f"@Model: torch.compile enabled with mode={self.compile_mode} *************")
 
         # 优化器与学习率调度器
-        self.optimizer = getattr(optim, config['optimizer_type'])(self.model.parameters(), **config['optimizer'])
+        self.optimizer = optim.Adam(self.model.parameters(), **config['optimizer'])
         self.lr_scheduler = getattr(optim.lr_scheduler, config['lr_scheduler_type'])(self.optimizer, **config['lr_scheduler'])
 
         # 数据集加载
@@ -66,7 +74,7 @@ class Trainer:
         self.logger.info("Training samples: %d", len(self.train_data_loader.dataset))
 
         # 混合精度训练
-        self.scaler = torch.amp.GradScaler(enabled=self.use_amp, device=self.device)
+        self.scaler = torch.amp.GradScaler(enabled=self.use_amp)
         self.monitor_best = -float('inf')
         self.loss_history = {}
 
@@ -83,6 +91,7 @@ class Trainer:
         else:
             self.logger.info("@Device: Using CPU *************")
 
+    @profile
     def _train(self):
         """训练主循环，完全保留论文训练流程"""
         torch.manual_seed(self.seed)
@@ -131,26 +140,27 @@ class Trainer:
         self.logger.info("Training finished! consumed %.17g sec", time.time() - start_time)
 
     def _train_epoch(self, epoch):
-        """单轮训练，完全保留论文损失计算与梯度更新逻辑"""
+        """单轮训练，消除强制同步阻塞"""
         self.model.train()
-        epoch_marl_loss = 0.0
-        epoch_las_loss = 0.0
-        epoch_total_loss = 0.0
+        # ✅ 用GPU张量累加loss，避免每个batch同步
+        epoch_marl_loss = torch.tensor(0.0, device=self.device)
+        epoch_las_loss = torch.tensor(0.0, device=self.device)
+        epoch_total_loss = torch.tensor(0.0, device=self.device)
         total_batch = len(self.train_data_loader)
 
         for batch_idx, (c, _) in enumerate(self.train_data_loader):
-            c = c.to(self.device, non_blocking=True)
+            c = c.to(self.device, non_blocking=True)  # non_blocking配合pin_memory异步拷贝
             B, C, H, W = c.shape
 
             # 网络前向传播，混合精度加速
             with torch.amp.autocast('cuda', enabled=self.use_amp):
                 prob = self.model(c)
-                # 恒定灰度图采样，用于各向异性抑制损失计算（论文要求）
+                # ✅ 修复batch_size，避免重编译
                 cg_gray_val = torch.rand(1, C, 1, 1, device=self.device) * 0.9 + 0.05
-                cg = cg_gray_val.expand(1, C, H, W)
+                cg = cg_gray_val.expand(B, C, H, W)
                 prob_cg = self.model(cg)
 
-            # 打印恒定灰度图概率分布，监控训练稳定性
+            # ✅ 仅在需要打印日志时，才执行.item()同步，其余时间不触发同步
             if batch_idx % self.log_freq == 0:
                 self.logger.info(
                     "prob_cg stats: min=%.17g max=%.17g mean=%.17g std=%.17g",
@@ -158,7 +168,7 @@ class Trainer:
                     prob_cg.mean().item(), prob_cg.std().item()
                 )
 
-            # 损失计算强制用FP32，避免精度问题，严格对齐论文损失公式
+            # 损失计算强制用FP32，避免精度问题
             prob = prob.float().contiguous()
             prob_cg = prob_cg.float().contiguous()
             c = c.float().contiguous()
@@ -171,7 +181,7 @@ class Trainer:
             total_loss = marl_loss + 0.002 * las_loss  # 论文式3-20
 
             # 反向传播与梯度更新
-            self.optimizer.zero_grad(set_to_none=True)  # 显存优化
+            self.optimizer.zero_grad(set_to_none=True)
             if self.use_amp:
                 self.scaler.scale(total_loss).backward()
                 self.scaler.unscale_(self.optimizer)
@@ -183,27 +193,29 @@ class Trainer:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                 self.optimizer.step()
 
-            # 损失累加与日志打印
-            marl_loss = torch.nan_to_num(marl_loss, nan=0.0, posinf=10.0, neginf=-10.0)
-            las_loss = torch.nan_to_num(las_loss, nan=0.0, posinf=100.0, neginf=0.0)
-            total_loss = torch.nan_to_num(total_loss, nan=0.0, posinf=10.0, neginf=-10.0)
-            epoch_marl_loss += marl_loss.item()
-            epoch_las_loss += las_loss.item()
-            epoch_total_loss += total_loss.item()
+            # ✅ GPU端无同步累加loss，仅做detach，不触发CPU-GPU同步
+            marl_loss = torch.nan_to_num(marl_loss.detach(), nan=0.0, posinf=10.0, neginf=-10.0)
+            las_loss = torch.nan_to_num(las_loss.detach(), nan=0.0, posinf=100.0, neginf=0.0)
+            total_loss = torch.nan_to_num(total_loss.detach(), nan=0.0, posinf=10.0, neginf=-10.0)
 
+            epoch_marl_loss += marl_loss
+            epoch_las_loss += las_loss
+            epoch_total_loss += total_loss
+
+            # ✅ 仅日志打印时触发一次同步，其余batch不执行
             if batch_idx % self.log_freq == 0:
                 self.logger.info(
-                    f"LE loss computed in {loss_ed - loss_st:.17g} sec, marl_loss={marl_loss:.17g}, grad_norm={grad_norm:.17g}")
+                    f"LE loss computed in {loss_ed - loss_st:.17g} sec, marl_loss={marl_loss.item():.17g}, grad_norm={grad_norm:.17g}")
                 self.logger.info("[%d/%d] iter:%d loss:%.17g ",
                                  epoch + 1, self.n_epochs,
                                  batch_idx + 1,
                                  total_loss.item())
 
-        # 单轮损失平均
+        # ✅ epoch结束后，一次性同步到CPU，仅触发1次同步
         epoch_loss = dict()
-        epoch_loss['marl_loss'] = epoch_marl_loss / total_batch
-        epoch_loss['las_loss'] = epoch_las_loss / total_batch
-        epoch_loss['total_loss'] = epoch_total_loss / total_batch
+        epoch_loss['marl_loss'] = (epoch_marl_loss / total_batch).item()
+        epoch_loss['las_loss'] = (epoch_las_loss / total_batch).item()
+        epoch_loss['total_loss'] = (epoch_total_loss / total_batch).item()
         return epoch_loss
 
     def _valid_epoch(self, epoch):

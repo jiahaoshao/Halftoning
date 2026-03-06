@@ -237,7 +237,7 @@ class Trainer:
                 cssim_score = cssim(c, h)
 
                 # 指标累加
-                total_psnr += psnr * B
+                total_psnr += psnr.sum().item()
                 total_cssim += cssim_score.sum().item()
 
         # 指标平均

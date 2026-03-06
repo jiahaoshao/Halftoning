@@ -1,9 +1,8 @@
 import torch
 import torch.nn.functional as F
-from typing import Tuple
+from typing import Tuple, Union, Optional, List
 from functools import lru_cache
 from torch import Tensor
-from pytorch_msssim import ssim
 
 # ====================== 全局配置 ======================
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -23,24 +22,22 @@ PROB_CLAMP_MAX = 1 - 1e-4
 DEFAULT_DTYPE = torch.float32
 
 
-# ====================== 工具函数（零拷贝+设备校验）======================
+# ====================== 工具函数 ======================
 def check_device(tensor: Tensor, func_name: str) -> None:
     if tensor.device.type != DEVICE_TYPE:
         raise RuntimeError(f"{func_name}: 设备类型不匹配，期望{DEVICE_TYPE}，实际{tensor.device.type}")
-
 
 def safe_contiguous(tensor: Tensor) -> Tensor:
     return tensor.contiguous() if not tensor.is_contiguous() else tensor
 
 
-# ====================== 预计算缓存（全局唯一，避免重复生成）======================
+# ====================== 预计算缓存 ======================
 @lru_cache(maxsize=8)
 def get_precomputed_coords(H: int, W: int) -> Tensor:
     y = torch.arange(H, device=DEVICE)
     x = torch.arange(W, device=DEVICE)
     y_grid, x_grid = torch.meshgrid(y, x, indexing='ij')
     return torch.stack([y_grid.flatten(), x_grid.flatten()], dim=1)
-
 
 @lru_cache(maxsize=1)
 def create_gaussian_kernel() -> Tensor:
@@ -51,7 +48,6 @@ def create_gaussian_kernel() -> Tensor:
     kernel = torch.outer(g_1d, g_1d)
     kernel /= kernel.sum()
     return kernel[None, None, :, :].contiguous()
-
 
 @lru_cache(maxsize=16)
 def get_radial_coords(H: int, W: int):
@@ -66,14 +62,12 @@ def get_radial_coords(H: int, W: int):
     r_vals = torch.where(r_mask)[0]
     return r, max_r, r_count, r_mask, r_vals
 
-
-# 全局预计算常量，避免重复初始化
+# 全局预计算常量
 HVS_KERNEL = create_gaussian_kernel()
 HVS_PADDING = HVS_HALF_KERNEL
-HVS_KERNEL_FLAT = HVS_KERNEL.flatten()  # 预计算展平核，用于局部差值计算
 
 
-# ====================== HVS低通滤波（批处理优化，无冗余拷贝）======================
+# ====================== HVS低通滤波 ======================
 def hvs_filter(x: Tensor) -> Tensor:
     check_device(x, "hvs_filter")
     x = torch.clamp(x, 0.0, 1.0)
@@ -81,9 +75,54 @@ def hvs_filter(x: Tensor) -> Tensor:
     return F.conv2d(x, HVS_KERNEL, padding=HVS_PADDING, groups=x.shape[1])
 
 
-# ====================== CSSIM核心计算（预计算拆分，避免重复计算）======================
+# ====================== 逐像素 SSIM 计算（使用HVS核）======================
+def pixelwise_ssim(
+    x: Tensor,
+    y: Tensor,
+    data_range: float = 1.0,
+    K: Tuple[float, float] = (CSSIM_K1, CSSIM_K2),
+    win: Optional[Tensor] = None,
+) -> Tensor:
+    """
+    返回与输入相同空间尺寸的 SSIM 图，形状 [B,1,H,W]
+    使用与 HVS 相同的 11x11 高斯核作为窗口权重
+    """
+    if x.dim() == 3:
+        x = x.unsqueeze(1)
+        y = y.unsqueeze(1)
+    B, C, H, W = x.shape
+    assert C == 1, "pixelwise_ssim only supports single channel"
+
+    if win is None:
+        win = HVS_KERNEL  # [1,1,11,11]
+
+    pad = HVS_HALF_KERNEL
+    # 计算局部均值
+    mu_x = F.conv2d(x, win, padding=pad)
+    mu_y = F.conv2d(y, win, padding=pad)
+
+    # 计算局部方差和协方差
+    mu_x_sq = mu_x ** 2
+    mu_y_sq = mu_y ** 2
+    mu_xy = mu_x * mu_y
+
+    sigma_x_sq = F.conv2d(x ** 2, win, padding=pad) - mu_x_sq
+    sigma_y_sq = F.conv2d(y ** 2, win, padding=pad) - mu_y_sq
+    sigma_xy = F.conv2d(x * y, win, padding=pad) - mu_xy
+
+    # 常数
+    C1 = (K[0] * data_range) ** 2
+    C2 = (K[1] * data_range) ** 2
+
+    # SSIM 图
+    ssim_map = ((2 * mu_xy + C1) * (2 * sigma_xy + C2)) / \
+               ((mu_x_sq + mu_y_sq + C1) * (sigma_x_sq + sigma_y_sq + C2) + EPS)
+    return ssim_map.clamp(0, 1)
+
+
+# ====================== CSSIM 核心计算 ======================
 def compute_sigma_c(c: Tensor) -> Tensor:
-    """预计算对比度图，全程复用，batch内只算一次"""
+    """预计算对比度图，全程复用"""
     B, C, H, W = c.shape
     c = torch.clamp(c, 0.0, 1.0)
     c = safe_contiguous(c)
@@ -95,168 +134,180 @@ def compute_sigma_c(c: Tensor) -> Tensor:
     sigma_c = sigma_c / sigma_c_max
     return torch.clamp(sigma_c, 0.0, 1.0)
 
-
-def cssim(c: Tensor, h: Tensor, sigma_c: Tensor = None) -> Tensor:
-    """支持传入预计算的sigma_c，避免重复计算"""
+def cssim(c: Tensor, h: Tensor, sigma_c: Optional[Tensor] = None) -> Tensor:
+    """
+    返回每个样本的CSSIM标量值（逐像素加权后平均）
+    """
     check_device(c, "cssim")
     check_device(h, "cssim")
     c = torch.clamp(c, 0.0, 1.0)
     h = torch.clamp(h, 0.0, 1.0)
-    # 复用预计算的sigma_c，batch内只算一次
     if sigma_c is None:
         sigma_c = compute_sigma_c(c)
-    ssim_map = ssim(
-        X=c, Y=h, data_range=DYNAMIC_RANGE_L, size_average=False,
-        win_size=HVS_KERNEL_SIZE, win_sigma=HVS_SIGMA,
-        K=(CSSIM_K1, CSSIM_K2), nonnegative_ssim=False
-    )[0]
+
+    # 逐像素 SSIM 图
+    ssim_map = pixelwise_ssim(c, h, data_range=DYNAMIC_RANGE_L, K=(CSSIM_K1, CSSIM_K2))
+
+    # 加权
     cssim_map = sigma_c * ssim_map + (1 - sigma_c) * 1.0
     cssim_map = torch.clamp(cssim_map, min=EPS, max=1.0)
-    return cssim_map.mean(dim=(1, 2, 3))
+    return cssim_map.mean(dim=(1, 2, 3))  # [B]
 
 
-# ====================== 奖励函数（验证用，训练梯度计算用局部差值函数）======================
-def reward(h: Tensor, c: Tensor, sigma_c: Tensor = None, w_s: float = REWARD_WS) -> Tensor:
-    """仅验证阶段使用，训练阶段用局部差值计算，避免整图重复计算"""
-    with torch.no_grad():
-        check_device(h, "reward")
-        check_device(c, "reward")
-        h = torch.clamp(h, 0.0, 1.0)
-        c = torch.clamp(c, 0.0, 1.0)
-        h_hvs = hvs_filter(h)
-        c_hvs = hvs_filter(c)
-        mse = F.mse_loss(h_hvs, c_hvs, reduction='none').mean(dim=(1, 2, 3))
-        cssim_score = cssim(c, h, sigma_c=sigma_c).unsqueeze(1)
-        r = -mse.unsqueeze(1) + w_s * cssim_score
-        return torch.clamp(r, min=-10.0, max=1.0)
-
-
-# ====================== 核心优化：局部奖励差值计算（彻底消除整图重复计算）======================
-@torch.jit.script  # 编译成TorchScript，消除Python开销，GPU并行加速
-def compute_local_reward_diff(
-        h_base: Tensor,
-        c_hvs: Tensor,
-        h_base_hvs: Tensor,
-        kernel_flat: Tensor,
-        kernel_size: int,
-        half_kernel: int,
-        H: int,
-        W: int,
-        B: int,
-        C: int
-) -> Tensor:
+# ====================== 局部MSE奖励变化计算 ======================
+def compute_local_mse_delta(h_sample: Tensor, c_hvs: Tensor, kernel: Tensor) -> Tuple[Tensor, Tensor]:
     """
-    向量化计算所有像素翻转后的MSE奖励差值，O(H*W)复杂度，与batch-size线性适配
-    核心原理：单个像素翻转仅影响11x11窗口内的HVS结果，直接计算差值而非整图卷积
+    高效计算每个像素翻转后的MSE奖励变化 ΔR_mse = -ΔMSE
+    返回两个张量 delta_R0, delta_R1，形状均为 [B,1,H,W]
     """
-    # 计算基础MSE图（逐像素）
-    base_mse_map = (h_base_hvs - c_hvs) ** 2  # [B,C,H,W]
+    B, C, H, W = h_sample.shape
 
-    # 计算每个像素翻转后的h_hvs变化量
-    delta_h_0 = -h_base  # 翻转为0的变化量：0 - h_base[y,x]
-    delta_h_1 = 1 - h_base  # 翻转为1的变化量：1 - h_base[y,x]
+    # 计算原始h_hvs
+    h_hvs = hvs_filter(h_sample)
 
-    # 用卷积计算每个像素翻转带来的h_hvs全局变化量（自动处理边界）
-    delta_hvs_0 = F.conv2d(delta_h_0, kernel_flat.view(1, 1, kernel_size, kernel_size), padding=half_kernel, groups=C)
-    delta_hvs_1 = F.conv2d(delta_h_1, kernel_flat.view(1, 1, kernel_size, kernel_size), padding=half_kernel, groups=C)
+    # 差值图
+    diff = h_hvs - c_hvs  # [B,1,H,W]
 
-    # 计算翻转后的MSE图
-    mse_0_map = (h_base_hvs + delta_hvs_0 - c_hvs) ** 2
-    mse_1_map = (h_base_hvs + delta_hvs_1 - c_hvs) ** 2
+    pad = HVS_HALF_KERNEL
+    # conv_diff = conv(diff, kernel)  # 每个位置的 Σ diff_i * K_{a,i}
+    conv_diff = F.conv2d(diff, kernel, padding=pad)
 
-    # 计算全局MSE差值（翻转为1 - 翻转为0）
-    mse_diff = (mse_1_map - mse_0_map).mean(dim=(1, 2, 3), keepdim=True)  # [B,1,1,1]
+    # conv_k2 = conv(ones, kernel^2)  # 每个位置的 Σ K_{a,i}^2
+    ones = torch.ones_like(diff)
+    kernel_sq = kernel ** 2
+    conv_k2 = F.conv2d(ones, kernel_sq, padding=pad)
 
-    # 最终奖励差值：-ΔMSE （CSSIM差值可根据需求扩展，论文中CSSIM权重极低，核心优化MSE部分）
-    reward_diff = -mse_diff
-    return reward_diff.squeeze(-1).squeeze(-1)  # [B,1]
+    factor = 1.0 / (H * W)
+
+    # 原像素值
+    h_val = h_sample
+
+    # 两种翻转的变化量
+    delta_0 = -h_val
+    delta_1 = 1 - h_val
+
+    # ΔMSE = (2*Δh*conv_diff + Δh^2*conv_k2) * factor
+    delta_mse_0 = (2 * delta_0 * conv_diff + delta_0**2 * conv_k2) * factor
+    delta_mse_1 = (2 * delta_1 * conv_diff + delta_1**2 * conv_k2) * factor
+
+    # ΔR_mse = -ΔMSE
+    delta_R0 = -delta_mse_0
+    delta_R1 = -delta_mse_1
+
+    return delta_R0.detach(), delta_R1.detach()
 
 
-# ====================== 重构LE梯度估计器（彻底消除batch-size影响，10-100倍加速）======================
-# 替换你loss.py中的le_gradient_estimator函数
+# ====================== 局部CSSIM奖励变化计算 ======================
+def compute_local_cssim_delta(
+    c: Tensor,
+    h_sample: Tensor,
+    sigma_c: Tensor,
+    w_s: float
+) -> Tuple[Tensor, Tensor]:
+    """
+    使用自动微分计算每个像素翻转对CSSIM奖励的影响（一阶近似）
+    返回 delta_C0, delta_C1，形状 [B,1,H,W]
+    """
+    # 创建可微副本用于梯度计算
+    h_grad = h_sample.detach().clone().requires_grad_(True)
+
+    # 计算当前CSSIM值（标量，每个样本一个）
+    cssim_val = cssim(c, h_grad, sigma_c)  # [B]
+
+    # 求CSSIM对h的梯度（每个像素的导数）
+    grad_h = torch.autograd.grad(cssim_val.sum(), h_grad, retain_graph=False)[0]  # [B,1,H,W]
+
+    # 像素翻转的变化量
+    delta_h0 = -h_sample
+    delta_h1 = 1 - h_sample
+
+    # 一阶近似 ΔCSSIM ≈ grad_h * Δh
+    delta_cssim0 = grad_h * delta_h0
+    delta_cssim1 = grad_h * delta_h1
+
+    # 奖励中CSSIM部分的变化量 = w_s * ΔCSSIM
+    delta_C0 = w_s * delta_cssim0
+    delta_C1 = w_s * delta_cssim1
+
+    return delta_C0.detach(), delta_C1.detach()
+
+
+# ====================== 完整LE梯度估计器 ======================
 def le_gradient_estimator(
         c: torch.Tensor,
         prob: torch.Tensor,
-        w_s: float = 0.06,
-        max_grad_norm: float = 10.0
+        w_s: float = REWARD_WS,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    完全对齐原论文LE梯度估计器公式，修复符号错误与梯度计算逻辑
+    完全对齐原论文LE梯度估计器公式 (3-15)
+    包括MSE和CSSIM两部分奖励变化，返回 (loss_marl, grad_norm)
     """
     B, C, H, W = prob.shape
     check_device(c, "le_gradient_estimator")
     check_device(prob, "le_gradient_estimator")
 
     c = c.to(dtype=DEFAULT_DTYPE, non_blocking=True)
-    # 动作概率：prob_1=选1的概率，prob_0=选0的概率
-    prob_1 = torch.clamp(prob, min=PROB_CLAMP_MIN, max=PROB_CLAMP_MAX)
-    prob_0 = 1 - prob_1
+    prob = torch.clamp(prob, PROB_CLAMP_MIN, PROB_CLAMP_MAX)
 
-    # ====================== 预计算共享项（全程复用）======================
-    with torch.no_grad():
-        c_hvs = hvs_filter(c)
-        sigma_c = compute_sigma_c(c)
+    # 1. 采样二值图像 h ~ Bernoulli(prob)
+    h_sample = torch.bernoulli(prob)  # [B,1,H,W]
 
-        # 分别计算两个动作的全局奖励
-        h_0 = torch.zeros_like(prob_1)
-        h_1 = torch.ones_like(prob_1)
-        # 动作0的奖励
-        h_0_hvs = hvs_filter(h_0)
-        mse_0 = F.mse_loss(h_0_hvs, c_hvs, reduction='none').mean(dim=(1, 2, 3))
-        cssim_0 = cssim(c, h_0, sigma_c=sigma_c)
-        r_0 = -mse_0 + w_s * cssim_0
-        # 动作1的奖励
-        h_1_hvs = hvs_filter(h_1)
-        mse_1 = F.mse_loss(h_1_hvs, c_hvs, reduction='none').mean(dim=(1, 2, 3))
-        cssim_1 = cssim(c, h_1, sigma_c=sigma_c)
-        r_1 = -mse_1 + w_s * cssim_1
+    # 2. 预计算HVS滤波结果和对比度图（用于CSSIM）
+    c_hvs = hvs_filter(c)
+    sigma_c = compute_sigma_c(c)
 
-        # 对齐维度，广播到每个像素
-        r_0 = r_0.view(B, C, 1, 1).expand(-1, -1, H, W)
-        r_1 = r_1.view(B, C, 1, 1).expand(-1, -1, H, W)
+    # 3. 计算MSE部分的奖励变化
+    delta_Rmse0, delta_Rmse1 = compute_local_mse_delta(h_sample, c_hvs, HVS_KERNEL)
 
-    # ====================== 完全对齐原论文的LE梯度计算 ======================
-    # 核心：策略梯度 = ∇ [ π_0*r_0 + π_1*r_1 ]，损失 = - 该值（最小化损失=最大化期望奖励）
-    expected_reward = (prob_0 * r_0 + prob_1 * r_1).mean()
-    loss_marl = -expected_reward  # 修复符号错误，优化方向完全对齐原论文
+    # 4. 计算CSSIM部分的奖励变化（利用梯度近似）
+    delta_C0, delta_C1 = compute_local_cssim_delta(c, h_sample, sigma_c, w_s)
 
-    # 数值稳定性处理
-    loss_marl = torch.nan_to_num(loss_marl, nan=0.0, posinf=1e3, neginf=-1e3)
-    r_0_norm = torch.norm(r_0, dim=1)  # [B]
-    r_1_norm = torch.norm(r_1, dim=1)  # [B]
-    grad_norm = torch.cat([r_0_norm, r_1_norm]).mean()  # 均值，或最大值
-    grad_norm = torch.nan_to_num(grad_norm, nan=0.0, posinf=1e3, neginf=-1e3)
+    # 5. 总奖励变化
+    delta_R0 = delta_Rmse0 + delta_C0
+    delta_R1 = delta_Rmse1 + delta_C1
+
+    # 6. 策略概率
+    prob_1 = prob  # π(1)
+    prob_0 = 1 - prob_1  # π(0)
+
+    # 7. 计算MARL损失（公式3-15的负号）
+    loss_per_pixel = prob_0 * delta_R0 + prob_1 * delta_R1  # [B,1,H,W]
+    loss_marl = -loss_per_pixel.mean()
+
+    # 8. 梯度范数（用于日志，近似估计）
+    grad_norm = (delta_R0.norm() + delta_R1.norm()) / (B * H * W)
 
     return loss_marl, grad_norm
 
 
-# ====================== 优化各向异性抑制损失（消除Python循环，batch-size无感知）======================
+# ====================== 各向异性抑制损失 ======================
 def anisotropy_suppression_loss(prob: Tensor) -> Tensor:
     """
-    优化后损失函数，消除Python循环，用向量化scatter_add替代，batch越大效率越高
+    优化后损失函数，向量化实现，完全对齐公式 (3-19)
+    注意：此函数应在恒定灰度图对应的概率输出上调用
     """
     check_device(prob, "anisotropy_suppression_loss")
     B, C, H, W = prob.shape
     prob_sq = prob.squeeze(1).to(DEFAULT_DTYPE)  # [B,H,W]
     prob_sq = torch.clamp(prob_sq, min=PROB_CLAMP_MIN, max=PROB_CLAMP_MAX)
 
-    # 预计算径向坐标（缓存复用）
+    # 预计算径向坐标
     r, max_r, r_count, r_mask, r_vals = get_radial_coords(H, W)
     r_flat = r.flatten()
 
-    # 傅里叶变换与功率谱计算（向量化，batch并行）
+    # 傅里叶变换与功率谱
     fft = torch.fft.fft2(prob_sq)
     fft_shift = torch.fft.fftshift(fft)
     P_hat = torch.abs(fft_shift) ** 2 / (H * W) + EPS  # [B,H,W]
     P_flat = P_hat.reshape(B, -1)  # [B, H*W]
 
-    # 向量化计算径向平均功率谱（替代Python循环，batch并行）
+    # 径向平均功率谱
     P_rho = torch.zeros(B, max_r + 1, device=DEVICE, dtype=DEFAULT_DTYPE)
-    P_rho = P_rho.scatter_add(1, r_flat.unsqueeze(0).expand(B, -1), P_flat)
+    P_rho.scatter_add_(1, r_flat.unsqueeze(0).expand(B, -1), P_flat)
     r_count_safe = r_count.clamp(min=1)
     P_rho = P_rho / r_count_safe.unsqueeze(0)  # [B, max_r+1]
 
-    # 计算各向异性损失（向量化）
+    # 各向异性损失
     P_rho_expand = P_rho[:, r_flat].reshape(B, H, W)  # [B,H,W]
     non_dc = (r >= 1).unsqueeze(0).expand_as(P_hat)
     loss = ((P_hat - P_rho_expand) ** 2 * non_dc).mean(dim=(1, 2)).mean()
@@ -264,11 +315,10 @@ def anisotropy_suppression_loss(prob: Tensor) -> Tensor:
     return torch.clamp(loss, min=1e-6).to(DEFAULT_DTYPE)
 
 
-# ====================== HVS-PSNR计算（验证用，无修改）======================
+# ====================== 验证指标：HVS-PSNR ======================
 def calculate_hvs_psnr(c: Tensor, h: Tensor) -> Tensor:
-    check_device(c, "calculate_hvs_psnr")
-    check_device(h, "calculate_hvs_psnr")
     c_hvs = hvs_filter(c)
     h_hvs = hvs_filter(h)
-    mse = F.mse_loss(c_hvs, h_hvs)
-    return 10 * torch.log10(1.0 / (mse + EPS))
+    mse = F.mse_loss(c_hvs, h_hvs, reduction='none').mean(dim=(1, 2, 3))
+    psnr = 10 * torch.log10(1.0 / (mse + EPS))
+    return psnr

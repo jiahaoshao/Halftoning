@@ -11,6 +11,10 @@ def ensure_dir(path):
         os.makedirs(path)
 
 def save_list(save_path, data_list, append_mode=False):
+    root, ext = os.path.splitext(save_path)
+    if ext.lower() != '.txt':
+        save_path = root + '.txt'
+
     n = len(data_list)
     if append_mode:
         with open(save_path, 'a') as f:

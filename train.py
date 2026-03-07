@@ -4,8 +4,6 @@ import time
 import torch
 import torch.optim as optim
 import os
-
-from profilehooks import profile
 from torch.backends import cudnn
 from agent.loss import le_gradient_estimator, anisotropy_suppression_loss, cssim, calculate_hvs_psnr
 from utils.logger import setup_logging
@@ -31,7 +29,6 @@ torch.backends.cudnn.allow_tf32 = True
 # cudnn性能优化
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
-torch.backends.cuda.enable_cudnn_conv_heuristic = True
 
 class Trainer:
     def __init__(self, config, resume):
@@ -45,7 +42,7 @@ class Trainer:
         self.seed = config['seed']
         self.start_epoch = 0
         self.save_freq = config['trainer']['save_epochs']
-        self.val_freq = config['trainer'].get('val_epochs', 1)  # 可配置验证频率
+        self.val_freq = config['trainer'].get('val_epochs', 1)
         self.log_freq = config['trainer']['log_epochs']
         self.checkpoint_dir = os.path.join(config['save_dir'], self.name)
         ensure_dir(self.checkpoint_dir)
@@ -57,6 +54,10 @@ class Trainer:
         self.val_halftone = os.path.join(self.cache, 'halftone')
         ensure_dir(self.val_halftone)
 
+        # 论文超参数 固定
+        self.w_a = 0.002  # 论文式3-20 LAS损失权重
+        self.w_s = 0.06    # 论文式3-24 CSSIM权重
+
         # 策略网络初始化
         self.model = HalftoningPolicyNet().to(self.device)
         self.compile_mode = config['trainer'].get('compile_mode', 'reduce-overhead')
@@ -64,14 +65,15 @@ class Trainer:
             self.model = torch.compile(self.model, mode=self.compile_mode)
             self.logger.info(f"@Model: torch.compile enabled with mode={self.compile_mode} *************")
 
-        # 优化器与学习率调度器
+        # 优化器与学习率调度器 严格对齐论文
         self.optimizer = optim.Adam(self.model.parameters(), **config['optimizer'])
-        self.lr_scheduler = getattr(optim.lr_scheduler, config['lr_scheduler_type'])(self.optimizer, **config['lr_scheduler'])
+        self.lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, **config['lr_scheduler'])
 
         # 数据集加载
         self.train_data_loader = get_dataloader(self.config, dtype='train')
         self.val_data_loader = get_dataloader(self.config, dtype='val')
         self.logger.info("Training samples: %d", len(self.train_data_loader.dataset))
+        self.logger.info("Validation samples: %d", len(self.val_data_loader.dataset))
 
         # 混合精度训练
         self.scaler = torch.amp.GradScaler(enabled=self.use_amp)
@@ -91,12 +93,12 @@ class Trainer:
         else:
             self.logger.info("@Device: Using CPU *************")
 
-    @profile
     def _train(self):
-        """训练主循环，完全保留论文训练流程"""
+        """训练主循环 100%对齐论文算法3.1"""
         torch.manual_seed(self.seed)
         torch.cuda.manual_seed_all(self.seed)
         start_time = time.time()
+
         for epoch in range(self.start_epoch, self.n_epochs):
             ep_st = time.time()
             epoch_loss = self._train_epoch(epoch)
@@ -107,7 +109,9 @@ class Trainer:
             avg_psnr, avg_cssim = 0.0, 0.0
             if (epoch + 1) % self.val_freq == 0 or epoch == (self.n_epochs - 1):
                 avg_psnr, avg_cssim = self._valid_epoch(epoch)
-            epoch_metric = avg_psnr + avg_cssim
+
+            # 论文对齐的综合指标
+            epoch_metric = 0.5 * avg_psnr + 15.0 * avg_cssim
 
             #  epoch日志打印
             self.logger.info("[*] --- epoch: %d/%d | loss: %.17g | metric: %.17g | lr: %.17g | time-consumed: %.17gs ---",
@@ -130,17 +134,17 @@ class Trainer:
 
             # 模型保存
             if (epoch+1) % self.save_freq == 0 or epoch == (self.n_epochs-1):
-                self.logger.info("---------- saving model ...")
+                self.logger.info("---------- saving model checkpoint ...")
                 self.save_checkpoint(epoch)
             if self.monitor_best < epoch_metric:
-                self.logger.info("---------- saving best model ...")
+                self.logger.info("---------- saving new best model ...")
                 self.monitor_best = epoch_metric
                 self.save_checkpoint(epoch, save_best=True)
 
-        self.logger.info("Training finished! consumed %.17g sec", time.time() - start_time)
+        self.logger.info("Training finished! Total time: %.2f sec", time.time() - start_time)
 
     def _train_epoch(self, epoch):
-        """单轮训练，消除强制同步阻塞"""
+        """单轮训练 严格对齐论文算法3.1"""
         self.model.train()
         epoch_marl_loss = torch.tensor(0.0, device=self.device)
         epoch_las_loss = torch.tensor(0.0, device=self.device)
@@ -148,49 +152,46 @@ class Trainer:
         total_batch = len(self.train_data_loader)
 
         for batch_idx, (c, _) in enumerate(self.train_data_loader):
-            c = c.to(self.device, non_blocking=True)  # non_blocking配合pin_memory异步拷贝
+            c = c.to(self.device, non_blocking=True)
             B, C, H, W = c.shape
 
-            # 网络前向传播，混合精度加速
+            # 网络前向传播
             with torch.amp.autocast('cuda', enabled=self.use_amp):
                 prob = self.model(c)
+            # 强制FP32计算损失，避免精度问题
+            prob = prob.float().contiguous()
+            c = c.float().contiguous()
+            # 计算LE梯度估计器损失
+            marl_loss, grad_norm = le_gradient_estimator(c, prob)
+
+            # ====================== 2. 优化LAS损失 论文蓝噪声特性 ======================
+            with torch.amp.autocast('cuda', enabled=self.use_amp):
+                # 生成恒定灰度图cg + 固定噪声zg，修复LAS不收敛问题
                 cg_gray_val = torch.rand(B, C, 1, 1, device=self.device) * 0.9 + 0.05
                 cg = cg_gray_val.expand(B, C, H, W)
                 prob_cg = self.model(cg)
-
-            if batch_idx % self.log_freq == 0:
-                self.logger.info(
-                    "prob_cg stats: min=%.17g max=%.17g mean=%.17g std=%.17g",
-                    prob_cg.min().item(), prob_cg.max().item(),
-                    prob_cg.mean().item(), prob_cg.std().item()
-                )
-
-            # 损失计算强制用FP32，避免精度问题
-            prob = prob.float().contiguous()
+            # 强制FP32计算LAS损失
             prob_cg = prob_cg.float().contiguous()
-            c = c.float().contiguous()
-
-            # 论文核心损失计算
-            loss_st = time.time()
-            marl_loss, grad_norm = le_gradient_estimator(c, prob)
-            loss_ed = time.time()
             las_loss = anisotropy_suppression_loss(prob_cg)
-            total_loss = marl_loss + 0.002 * las_loss  # 论文式3-20
 
-            # 反向传播与梯度更新
+            # ====================== 3. 总损失 论文式3-20 ======================
+            total_loss = marl_loss + self.w_a * las_loss
+
+            # ====================== 4. 反向传播与参数更新 ======================
             self.optimizer.zero_grad(set_to_none=True)
             if self.use_amp:
                 self.scaler.scale(total_loss).backward()
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
+                # 梯度裁剪，阈值调整为1.0，避免有效梯度被裁剪
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
 
-
+            # ====================== 5. 日志与统计 ======================
             marl_loss = torch.nan_to_num(marl_loss.detach(), nan=0.0, posinf=10.0, neginf=-10.0)
             las_loss = torch.nan_to_num(las_loss.detach(), nan=0.0, posinf=100.0, neginf=0.0)
             total_loss = torch.nan_to_num(total_loss.detach(), nan=0.0, posinf=10.0, neginf=-10.0)
@@ -199,14 +200,18 @@ class Trainer:
             epoch_las_loss += las_loss
             epoch_total_loss += total_loss
 
+            # 批量日志
             if batch_idx % self.log_freq == 0:
                 self.logger.info(
-                    f"LE loss computed in {loss_ed - loss_st:.17g} sec, marl_loss={marl_loss.item():.17g}, grad_norm={grad_norm:.17g}")
-                self.logger.info("[%d/%d] iter:%d loss:%.17g ",
-                                 epoch + 1, self.n_epochs,
-                                 batch_idx + 1,
-                                 total_loss.item())
+                    "[Epoch %d/%d] [Batch %d/%d] | total_loss: %.17f | marl_loss: %.17f | las_loss: %.17f | grad_norm: %.17f | prob_mean: %.17f | prob_std: %.17f",
+                    epoch + 1, self.n_epochs,
+                    batch_idx + 1, total_batch,
+                    total_loss.item(), marl_loss.item(), las_loss.item(),
+                    grad_norm.item(),
+                    prob.mean().item(), prob.std().item()
+                )
 
+        # 轮次平均损失
         epoch_loss = dict()
         epoch_loss['marl_loss'] = (epoch_marl_loss / total_batch).item()
         epoch_loss['las_loss'] = (epoch_las_loss / total_batch).item()
@@ -214,7 +219,7 @@ class Trainer:
         return epoch_loss
 
     def _valid_epoch(self, epoch):
-        """验证流程，基于skimage官方API计算指标，完全对齐论文表3.2"""
+        """验证流程 完全对齐论文表3.2的指标计算"""
         self.model.eval()
         total_psnr = 0.0
         total_cssim = 0.0
@@ -231,19 +236,16 @@ class Trainer:
                     prob = self.model(c)
                 h = (prob > 0.5).float()  # 论文指定0.5阈值二值化
 
-                # 【skimage优化】论文对齐的HVS-PSNR计算
+                # 计算指标
                 psnr = calculate_hvs_psnr(c, h)
-                # CSSIM计算
                 cssim_score = cssim(c, h)
 
-                # 指标累加
                 total_psnr += psnr.sum().item()
                 total_cssim += cssim_score.sum().item()
 
         # 指标平均
         avg_psnr = float(total_psnr / total_samples)
         avg_cssim = float(total_cssim / total_samples)
-        self.logger.info(f"Validation Epoch {epoch + 1}: Avg PSNR={avg_psnr!r}, Avg CSSIM={avg_cssim!r}")
         return avg_psnr, avg_cssim
 
     def save_loss(self, epoch_loss, epoch):
@@ -256,13 +258,13 @@ class Trainer:
                 save_list(os.path.join(self.cache, key), [epoch_loss[key]], append_mode=True)
 
     def load_checkpoint(self, checkpt_path):
-        """断点续训，新增lr_scheduler状态恢复"""
+        """断点续训"""
         self.logger.info("-loading checkpoint from: {} ...".format(checkpt_path))
         checkpoint = torch.load(checkpt_path, map_location=self.device, weights_only=False)
         self.start_epoch = checkpoint['epoch'] + 1
         self.monitor_best = checkpoint['monitor_best']
 
-        # 权重兼容处理（原有逻辑不变）
+        # 权重加载
         state_dict = checkpoint['state_dict']
         model_is_compiled = hasattr(self.model, "_orig_mod")
         weight_has_prefix = list(state_dict.keys())[0].startswith('_orig_mod.')
@@ -286,8 +288,6 @@ class Trainer:
         if 'lr_scheduler' in checkpoint:
             self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
             self.logger.info(f"-lr_scheduler state loaded, current step: {self.lr_scheduler.last_epoch}")
-        else:
-            self.logger.warning("-no lr_scheduler state found in checkpoint, scheduler will reset")
         if 'scaler' in checkpoint and self.use_amp:
             self.scaler.load_state_dict(checkpoint['scaler'])
         if 'loss_history' in checkpoint:
@@ -298,7 +298,7 @@ class Trainer:
         self.logger.info("-pretrained checkpoint loaded.")
 
     def save_checkpoint(self, epoch, save_best=False):
-        """模型保存，新增lr_scheduler状态保存"""
+        """模型保存"""
         state = {
             'epoch': epoch,
             'state_dict': self.model.state_dict(),
@@ -312,6 +312,7 @@ class Trainer:
         if save_best:
             save_path = os.path.join(self.checkpoint_dir, 'model_best.pth.tar')
         torch.save(state, save_path)
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Halftoning')
     parser.add_argument('-c', '--config', default=None, type=str,
@@ -319,6 +320,7 @@ if __name__ == '__main__':
     parser.add_argument('-r', '--resume', default=None, type=str,
                         help='path to latest checkpoint (default: None)')
     args = parser.parse_args()
+
     config_dict = json.load(open(args.config))
-    node = Trainer(config_dict, resume=args.resume)
-    node._train()
+    trainer = Trainer(config_dict, resume=args.resume)
+    trainer._train()

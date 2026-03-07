@@ -27,7 +27,7 @@
     "optimizer_type": "Adam",
     "optimizer": {
         "lr": 3e-4,
-        "weight_decay": 0,
+        "weight_decay": 1e-5,
         "fused": true
     },
     "lr_scheduler_type": "CosineAnnealingLR",

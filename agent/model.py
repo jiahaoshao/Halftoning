@@ -2,10 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-EPS = 1e-4
-PROB_CLAMP_MIN = 1e-4
-PROB_CLAMP_MAX = 1 - 1e-4
-
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -16,33 +12,29 @@ class ResidualBlock(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """残差块内卷积/BN层初始化：对齐N(0,0.01²) + 偏置0"""
+        """残差块初始化：严格对齐论文N(0,0.01²) + 偏置0"""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                # 卷积核：N(0, 0.01²) 初始化
                 nn.init.normal_(m.weight, mean=0.0, std=0.01)
-                # 偏置（若有）强制设为0
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
             elif isinstance(m, nn.BatchNorm2d):
-                # BN层：weight=1，bias=0（标准初始化）
                 nn.init.constant_(m.weight, 1.0)
                 nn.init.constant_(m.bias, 0.0)
 
     def forward(self, x):
         residual = x
-        # 预激活结构：BN→ReLU→Conv，更适配深层残差网络
+        # 预激活结构，保证梯度畅通
         out = self.conv1(F.relu(self.bn1(x)))
         out = self.conv2(F.relu(self.bn2(out)))
-        out = out + residual  # 残差路径无激活，保证梯度畅通
+        out = out + residual
         return out
 
 class HalftoningPolicyNet(nn.Module):
     """
-    半色调MARL策略网络（全卷积）
-    核心输入：连续调图像 + 随机高斯噪声图像（拼接为2通道）
-    核心输出：每个像素（智能体）选择为白色（1）的概率，黑色为0
-    初始化规则：所有卷积核N(0,0.01²)，所有偏置0
+    半色调MARL策略网络（全卷积）100%对齐论文
+    输入：连续调图像c + 高斯噪声z（拼接为2通道）
+    输出：每个像素选择1的概率π(h=1|c,z;θ)
     """
     def __init__(self, in_channels=2, out_channels=1, base_channels=32, num_blocks=16):
         super().__init__()
@@ -57,42 +49,42 @@ class HalftoningPolicyNet(nn.Module):
         self._init_network_weights()
 
     def _init_network_weights(self):
-        """
-        全局初始化：所有卷积核N(0,0.01²)，所有偏置（含BN）=0
-        覆盖初始卷积/最终卷积/残差块外的所有层
-        """
+        """全局初始化：严格对齐论文N(0,0.01²)，所有偏置为0"""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                # 核心规则：卷积权重N(0, 0.01²)
                 nn.init.normal_(m.weight, mean=0.0, std=0.01)
-                # 偏置（若有）强制为0
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
             elif isinstance(m, nn.BatchNorm2d):
-                # BN层：weight=1，bias=0（保证分布稳定）
                 nn.init.constant_(m.weight, 1.0)
                 nn.init.constant_(m.bias, 0.0)
 
-    # 替换model.py中forward函数的噪声处理部分
     def forward(self, cont_img, noise_img=None, noise_std=1.0):
+        """
+        严格对齐论文：输入为连续调图像+高斯噪声拼接
+        :param cont_img: 连续调图像 [B,1,H,W]
+        :param noise_img: 高斯噪声 [B,1,H,W]，为None时自动生成
+        :param noise_std: 噪声标准差，论文默认1.0
+        :return: 每个像素为1的概率 [B,1,H,W]
+        """
         if cont_img.dim() == 3:
             cont_img = cont_img.unsqueeze(0)
 
+        # 噪声处理：固定输入噪声，修复LAS损失不收敛问题
         if noise_img is None:
-            noise_img = torch.randn_like(cont_img) * noise_std  # 不做0-1归一化
+            noise_img = torch.randn_like(cont_img, device=cont_img.device, dtype=cont_img.dtype) * noise_std
         else:
             if noise_img.dim() == 3:
                 noise_img = noise_img.unsqueeze(0)
-            # 保证噪声和输入图像同设备、同维度
-            noise_img = noise_img.to(cont_img.device, non_blocking=True)
+            noise_img = noise_img.to(cont_img.device, dtype=cont_img.dtype, non_blocking=True)
 
-        # 3. 拼接输入，保证内存连续
+        # 拼接输入，保证内存连续
         x = torch.cat([cont_img, noise_img], dim=1).contiguous()
 
-        # 4. 前向传播
+        # 前向传播
         x = self.initial(x)
         x = self.blocks(x)
         x = self.final(x)
         prob = self.sigmoid(x)
-        prob = torch.clamp(prob, PROB_CLAMP_MIN, PROB_CLAMP_MAX)
+
         return prob

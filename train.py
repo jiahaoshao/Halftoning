@@ -79,6 +79,7 @@ class Trainer:
         self.scaler = torch.amp.GradScaler(enabled=self.use_amp)
         self.monitor_best = -float('inf')
         self.loss_history = {}
+        self.global_step = 0
 
         # 断点续训
         if self.resume_path:
@@ -141,6 +142,10 @@ class Trainer:
                 self.monitor_best = epoch_metric
                 self.save_checkpoint(epoch, save_best=True)
 
+            if self.global_step >= 200000:
+                print(f"已完成论文要求的{200000}次迭代，训练正常终止")
+                break
+
         self.logger.info("Training finished! Total time: %.2f sec", time.time() - start_time)
 
     def _train_epoch(self, epoch):
@@ -191,6 +196,8 @@ class Trainer:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
 
+            self.global_step += 1
+
             # ====================== 5. 日志与统计 ======================
             marl_loss = torch.nan_to_num(marl_loss.detach(), nan=0.0, posinf=10.0, neginf=-10.0)
             las_loss = torch.nan_to_num(las_loss.detach(), nan=0.0, posinf=100.0, neginf=0.0)
@@ -219,7 +226,6 @@ class Trainer:
         return epoch_loss
 
     def _valid_epoch(self, epoch):
-        """验证流程 完全对齐论文表3.2的指标计算"""
         self.model.eval()
         total_psnr = 0.0
         total_cssim = 0.0
@@ -231,19 +237,15 @@ class Trainer:
                 B, C, H, W = c.shape
                 total_samples += B
 
-                # 模型推理
                 with torch.amp.autocast('cuda', enabled=self.use_amp):
                     prob = self.model(c)
-                h = (prob > 0.5).float()  # 论文指定0.5阈值二值化
+                h = torch.bernoulli(prob).detach().float()
 
-                # 计算指标
                 psnr = calculate_hvs_psnr(c, h)
                 cssim_score = cssim(c, h)
-
                 total_psnr += psnr.sum().item()
                 total_cssim += cssim_score.sum().item()
 
-        # 指标平均
         avg_psnr = float(total_psnr / total_samples)
         avg_cssim = float(total_cssim / total_samples)
         return avg_psnr, avg_cssim
@@ -263,6 +265,7 @@ class Trainer:
         checkpoint = torch.load(checkpt_path, map_location=self.device, weights_only=False)
         self.start_epoch = checkpoint['epoch'] + 1
         self.monitor_best = checkpoint['monitor_best']
+        self.global_step = checkpoint['global_step']
 
         # 权重加载
         state_dict = checkpoint['state_dict']
@@ -306,7 +309,8 @@ class Trainer:
             'lr_scheduler': self.lr_scheduler.state_dict(),
             'monitor_best': self.monitor_best,
             'scaler': self.scaler.state_dict() if self.use_amp else None,
-            'loss_history': self.loss_history
+            'loss_history': self.loss_history,
+            'global_step': self.global_step
         }
         save_path = os.path.join(self.checkpoint_dir, 'model_last.pth.tar')
         if save_best:

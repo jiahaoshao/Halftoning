@@ -143,17 +143,18 @@ def pixelwise_ssim(
 
     if win is None:
         win = CSSIM_GAUSS_KERNEL
-    pad = HVS_HALF_KERNEL
 
-    mu_x = F.conv2d(x, win, padding=pad, groups=C)
-    mu_y = F.conv2d(y, win, padding=pad, groups=C)
+    mu_x = F.conv2d(x, win, padding=HVS_HALF_KERNEL, groups=C)
+    mu_y = F.conv2d(y, win, padding=HVS_HALF_KERNEL, groups=C)
 
     mu_x_sq = mu_x ** 2
     mu_y_sq = mu_y ** 2
     mu_xy = mu_x * mu_y
-    sigma_x_sq = F.conv2d(x ** 2, win, padding=pad, groups=C) - mu_x_sq
-    sigma_y_sq = F.conv2d(y ** 2, win, padding=pad, groups=C) - mu_y_sq
-    sigma_xy = F.conv2d(x * y, win, padding=pad, groups=C) - mu_xy
+    sigma_x_sq = F.conv2d(x ** 2, win, padding=HVS_HALF_KERNEL, groups=C) - mu_x_sq
+    sigma_y_sq = F.conv2d(y ** 2, win, padding=HVS_HALF_KERNEL, groups=C) - mu_y_sq
+    sigma_x_sq = torch.clamp(sigma_x_sq, min=0.0)  # 防止浮点负值
+    sigma_y_sq = torch.clamp(sigma_y_sq, min=0.0)
+    sigma_xy = F.conv2d(x * y, win, padding=HVS_HALF_KERNEL, groups=C) - mu_xy
 
     C1 = (K[0] * data_range) ** 2
     C2 = (K[1] * data_range) ** 2
@@ -196,98 +197,56 @@ def cssim(c: Tensor, h: Tensor, sigma_c: Optional[Tensor] = None) -> Tensor:
     return cssim_map.mean(dim=(1, 2, 3))  # [B]
 
 
-# ====================== LE梯度估计器（论文式3-14/3-15）======================
 def le_gradient_estimator(
         c: torch.Tensor,
         prob: torch.Tensor,
         w_s: float = REWARD_WS,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    论文式(3-15) LE梯度估计器
-
-    核心思路：
-    论文公式 ∇_θ L = -E[Σ_a Σ_{h_a'} ∇_θ π_a(h_a') R({h_a',h_{-a}})]
-
-    等价REINFORCE形式：
-    L = -E_h[ log π(h) * ( R(h) - baseline ) ]
-
-    baseline用多采样估计减方差。
-
-    关键：ΔR不除以N，保持O(1)量级的梯度信号。
-    论文中的奖励R是对"整张图"的全局评价，
-    但LE估计器关心的是每个像素翻转对R的影响——这个影响
-    不应该被N稀释，因为我们是在做逐像素的策略梯度更新。
-    """
-    B, C, H, W = prob.shape
-    N = H * W
     check_device(c, "le_gradient_estimator")
     check_device(prob, "le_gradient_estimator")
+
+    B, C, H, W = prob.shape
+    N = H * W
+
     c = c.to(dtype=DEFAULT_DTYPE, non_blocking=True)
     prob = prob.to(dtype=DEFAULT_DTYPE, non_blocking=True)
     prob = torch.clamp(prob, PROB_CLAMP_MIN, PROB_CLAMP_MAX)
 
-    # 1. 采样二值图像
     h_sample = torch.bernoulli(prob).detach()
 
-    # 2. 预计算
     sigma_c = compute_sigma_c(c)
     c_hvs = hvs_filter(c, padding=HVS_PADDING)
     h_hvs = hvs_filter(h_sample, padding=HVS_PADDING)
-    diff = h_hvs - c_hvs  # [B,1,H,W]
+    diff = h_hvs - c_hvs
 
-    # 3. MSE翻转变化量——不除以N，保持O(1)量级
-    pad = HVS_HALF_KERNEL
-    conv_diff = F.conv2d(diff, HVS_KERNEL, padding=pad, groups=C)
+    kernel = HVS_KERNEL
     kernel_sq = HVS_KERNEL ** 2
-    conv_k2 = F.conv2d(torch.ones_like(diff), kernel_sq, padding=pad, groups=C)
+    conv_diff = F.conv2d(diff, kernel, padding=HVS_HALF_KERNEL, groups=C)
+    conv_k2 = F.conv2d(torch.ones_like(diff), kernel_sq, padding=HVS_HALF_KERNEL, groups=C)
 
-    h_val = h_sample
-    delta_0 = -h_val
-    delta_1 = 1.0 - h_val
+    delta_0 = -h_sample
+    delta_1 = 1.0 - h_sample
 
-    # ΔR_mse(a) = -(2*δ*conv_diff + δ²*conv_k2)  【不除以N】
     delta_Rmse_0 = -(2.0 * delta_0 * conv_diff + delta_0 ** 2 * conv_k2)
     delta_Rmse_1 = -(2.0 * delta_1 * conv_diff + delta_1 ** 2 * conv_k2)
 
-    # 4. CSSIM翻转变化量（自动微分一阶近似）
-    # cssim()内部有mean(1/N)，所以grad_cssim自带1/N量级
-    # 乘回N使其与MSE部分对齐到O(1)量级
+    # CSSIM 部分：grad_cssim 乘以 N 以匹配量级
     h_grad = h_sample.detach().clone().requires_grad_(True)
     cssim_val = cssim(c, h_grad, sigma_c)
-    grad_cssim = torch.autograd.grad(cssim_val.sum(), h_grad, retain_graph=False)[0]
-    # grad_cssim 自带 1/N，乘回 N 使量级对齐
-    grad_cssim = grad_cssim * N
+    grad_cssim = torch.autograd.grad(cssim_val.sum(), h_grad, retain_graph=False)[0] * N
 
     delta_Rcssim_0 = w_s * grad_cssim * delta_0
     delta_Rcssim_1 = w_s * grad_cssim * delta_1
 
-    # 5. 总ΔR
     delta_R0 = (delta_Rmse_0 + delta_Rcssim_0).detach()
     delta_R1 = (delta_Rmse_1 + delta_Rcssim_1).detach()
 
-    # 6. 策略概率
+    prob_0 = 1.0 - prob
     prob_1 = prob
-    prob_0 = 1.0 - prob_1
+    loss_marl = -(prob_0 * delta_R0 + prob_1 * delta_R1).mean()
 
-    # 7. 计算每像素的期望优势（作为advantage）
-    # baseline = E_{h_a'}[ΔR] = π_0*ΔR_0 + π_1*ΔR_1
-    baseline = (prob_0 * delta_R0 + prob_1 * delta_R1).detach()
-    A0 = (delta_R0 - baseline).detach()
-    A1 = (delta_R1 - baseline).detach()
-
-    # 8. REINFORCE: L = -E[ log π(h_a) * A(h_a) ]
-    log_prob_1 = torch.log(prob_1 + EPS)
-    log_prob_0 = torch.log(prob_0 + EPS)
-
-    log_pi_selected = h_sample * log_prob_1 + (1.0 - h_sample) * log_prob_0
-    advantage_selected = h_sample * A1 + (1.0 - h_sample) * A0
-
-    loss_marl = -(log_pi_selected * advantage_selected).mean()
-
-    # 9. 梯度监控
-    grad_norm = advantage_selected.abs().mean().detach()
-
-    return loss_marl, grad_norm
+    delta_norm = (delta_R0.abs() + delta_R1.abs()).mean().detach()
+    return loss_marl, delta_norm
 
 
 # ====================== 各向异性抑制损失（论文式3-19）======================
@@ -321,8 +280,8 @@ def anisotropy_suppression_loss(prob: Tensor) -> Tensor:
 # ====================== 验证指标：HVS-PSNR ======================
 def calculate_hvs_psnr(c: Tensor, h: Tensor) -> Tensor:
     """基于Näsänen HVS滤波的PSNR计算"""
-    c_hvs = hvs_filter(c, padding=0)
-    h_hvs = hvs_filter(h, padding=0)
+    c_hvs = hvs_filter(c, padding=HVS_PADDING)
+    h_hvs = hvs_filter(h, padding=HVS_PADDING)
     mse = F.mse_loss(c_hvs, h_hvs, reduction='none').mean(dim=(1, 2, 3))
     psnr = 10 * torch.log10(1.0 / (mse + EPS))
     return psnr

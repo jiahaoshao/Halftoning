@@ -5,8 +5,8 @@ import torch.nn.functional as F
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, 3, stride=1, padding=1, bias=False)
-        self.conv2 = nn.Conv2d(channels, channels, 3, stride=1, padding=1, bias=False)
+        self.conv1 = nn.Conv2d(channels, channels, 3, stride=1, padding=1, bias=True)
+        self.conv2 = nn.Conv2d(channels, channels, 3, stride=1, padding=1, bias=True)
         self.bn1 = nn.BatchNorm2d(channels)
         self.bn2 = nn.BatchNorm2d(channels)
         self._init_weights()
@@ -39,12 +39,12 @@ class HalftoningPolicyNet(nn.Module):
     def __init__(self, in_channels=2, out_channels=1, base_channels=32, num_blocks=16):
         super().__init__()
         self.initial = nn.Sequential(
-            nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1, stride=1, bias=False),
+            nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1, stride=1, bias=True),
             nn.BatchNorm2d(base_channels),
             nn.ReLU(inplace=True)
         )
         self.blocks = nn.Sequential(*[ResidualBlock(base_channels) for _ in range(num_blocks)])
-        self.final = nn.Conv2d(base_channels, out_channels, kernel_size=3, padding=1, stride=1, bias=False)
+        self.final = nn.Conv2d(base_channels, out_channels, kernel_size=3, padding=1, stride=1, bias=True)
         self.sigmoid = nn.Sigmoid()
         self._init_network_weights()
 

@@ -55,7 +55,7 @@ class Inferencer:
                 prob = self.model(imgs)
 
                 # 二值化处理
-                halftones = (prob > 0.5).float()
+                halftones = torch.bernoulli(prob)
 
                 # 保存结果
                 for j in range(len(filenames)):

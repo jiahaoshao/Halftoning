@@ -1,98 +1,158 @@
 import json
-import subprocess
-
 import numpy as np
 import cv2
-import os, argparse
-
+import os
+import argparse
 import torch
-
 from agent.model import HalftoningPolicyNet
 from collections import OrderedDict
-
-from utils.dataset import get_dataloader
 
 
 class Inferencer:
     def __init__(self, checkpoint_path, model):
         print(f"Loading checkpoint from {checkpoint_path}...")
 
+        # 自动选择设备
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Using device: {self.device}")
+
         # 加载权重
-        checkpoint = torch.load(checkpoint_path)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
         if 'state_dict' in checkpoint:
             state_dict = checkpoint['state_dict']
         else:
             state_dict = checkpoint
 
-        # 移除 'module.' 前缀（如果是多卡训练保存的权重）
+        # 移除前缀
         new_state_dict = OrderedDict()
         for k, v in state_dict.items():
-            # 1. 移除 _orig_mod. 前缀（torch.compile导致）
             if k.startswith('_orig_mod.'):
-                name = k[len('_orig_mod.'):]  # 截取 _orig_mod. 之后的部分
-            # 2. 移除 module. 前缀（多卡训练导致）
+                name = k[len('_orig_mod.'):]
             elif k.startswith('module.'):
                 name = k[7:]
             else:
                 name = k
             new_state_dict[name] = v
 
-        self.model = model
+        self.model = model.to(self.device)
         self.model.load_state_dict(new_state_dict)
         self.model.eval()
 
-    def infer(self, dataloader, save_dir):
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir)
-
-        print(f"Start inference on {len(dataloader.dataset)} images...")
+    def infer(self, img_tensor):
+        """
+        核心推理函数：接收图片 Tensor，返回生成的半色调图片 Tensor
+        :param img_tensor: 输入图片 Tensor，形状应为 (1, 1, H, W)，值域 [0, 1]
+        :return: 输出图片 Tensor，形状为 (1, 1, H, W)，值域 {0, 1}
+        """
+        # 将数据移到对应设备
+        img_tensor = img_tensor.to(self.device)
 
         with torch.no_grad():
-            for i, (imgs, filenames) in enumerate(dataloader):
-                imgs = imgs
+            # 模型推理
+            prob = self.model(img_tensor)
+            # 二值化处理
+            halftone = (prob > 0.5).float()
 
-                # 模型推理
-                prob = self.model(imgs)
+        # 返回结果（如果希望在外部使用，通常也可以移回 cpu，但这里先保持原样，由调用者决定）
+        return halftone
 
-                # 二值化处理
-                halftones = torch.bernoulli(prob)
+    def infer_and_save(self, input_path, output_path):
+        """
+        便捷函数：传入图片地址和保存地址（文件夹或文件），自动完成加载、推理、保存
+        :param input_path: 输入图片路径
+        :param output_path: 输出文件夹路径 或 完整的文件路径
+        """
+        # 1. 加载并预处理图片
+        img_tensor = self._load_image(input_path)
 
-                # 保存结果
-                for j in range(len(filenames)):
-                    filename = filenames[j]
-                    ht_tensor = halftones[j].cpu().squeeze().numpy()  # (H, W)
+        # 2. 调用核心推理函数
+        halftone_tensor = self.infer(img_tensor)
 
-                    # 映射回 0-255 并转为 uint8
-                    ht_img = (ht_tensor * 255).astype(np.uint8)
+        # 3. 确定最终保存路径
+        # 判断 output_path 是否为文件夹，或者是否没有后缀
+        # 如果是文件夹，或者路径不存在且不含后缀，则认为是要存到该文件夹下
+        is_dir = os.path.isdir(output_path)
+        has_no_ext = os.path.splitext(output_path)[1] == ''
 
-                    base = os.path.splitext(os.path.basename(filename))[0]
-                    ext = os.path.splitext(filename)[1]
-                    if not ext:
-                        ext = '.jpg'
-                    save_name = f"{base}_halftone{ext}"
-                    save_path = os.path.join(save_dir, save_name)
-                    cv2.imwrite(save_path, ht_img)
-                    print(f"[{i * dataloader.batch_size + j + 1}/{len(dataloader.dataset)}] Saved: {save_path}")
+        final_save_path = output_path
+        if is_dir or has_no_ext:
+            # 确保文件夹存在
+            if not os.path.exists(output_path):
+                os.makedirs(output_path)
+
+            # 从 input_path 获取原始文件名
+            original_name = os.path.basename(input_path)
+            name, ext = os.path.splitext(original_name)
+
+            # 生成新文件名 (例如: input.jpg -> input_halftone.png)
+            # 强制使用 png 防止 jpg 压缩损失半色调细节
+            new_filename = f"{name}_halftone.png"
+
+            # 拼接路径
+            final_save_path = os.path.join(output_path, new_filename)
+
+        # 4. 后处理并保存
+        self._save_image(halftone_tensor, final_save_path)
+
+    def _load_image(self, img_path):
+        """内部方法：读取图片并转为 Tensor"""
+        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise ValueError(f"Cannot read image: {img_path}")
+
+        # 归一化
+        img = img.astype(np.float32) / 255.0
+        # 转为 Tensor: (H, W) -> (1, 1, H, W)
+        img_tensor = torch.from_numpy(img).unsqueeze(0).unsqueeze(0)
+        return img_tensor
+
+    def _save_image(self, tensor, save_path):
+        """内部方法：将 Tensor 保存为图片"""
+        # 1. 确保目录存在
+        save_dir = os.path.dirname(save_path)
+        if save_dir and not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
+        # 2. 检查并修复文件后缀名
+        # 获取后缀 (如 '.jpg')
+        ext = os.path.splitext(save_path)[1].lower()
+
+        # 支持的格式列表
+        valid_exts = ['.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff']
+
+        # 如果没有后缀，或者后缀不支持，强制加上 .png
+        if ext not in valid_exts:
+            print(f"Warning: File extension '{ext}' not recognized or missing. Appending '.png'.")
+            save_path = save_path + '.png'  # 或者你喜欢的 '.jpg'
+
+        # 3. 后处理
+        # squeeze 去掉 batch 和 channel -> (H, W)
+        ht_np = tensor.cpu().squeeze().numpy()
+        # 映射回 0-255
+        ht_img = (ht_np * 255).astype(np.uint8)
+
+        # 4. 保存
+        success = cv2.imwrite(save_path, ht_img)
+        if success:
+            print(f"Image saved successfully: {save_path}")
+        else:
+            # 如果依然失败，尝试一个绝对安全的路径
+            backup_path = os.path.join(os.getcwd(), "backup_output.png")
+            cv2.imwrite(backup_path, ht_img)
+            print(f"Failed to save to original path. Saved to backup instead: {backup_path}")
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Halftoning')
-    parser.add_argument('-c', '--config', default=None, type=str,
-                        help='config file path (default: None)')
-    parser.add_argument('--model', default=None, type=str,
-                        help='model weight file path')
-    parser.add_argument('--save_dir', default=None, type=str,
-                        help='where to save the result')
+    parser = argparse.ArgumentParser(description='Halftoning Inference')
+    parser.add_argument('--model', required=True, type=str, help='model weight file path')
+    parser.add_argument('--input', required=True, type=str, help='input image path')
+    parser.add_argument('--output', required=True, type=str, help='output image path')
     args = parser.parse_args()
 
-    config = json.load(open(args.config))
-
-    test_data_loader = get_dataloader(config, dtype='test')
-
+    # 初始化
     model = HalftoningPolicyNet()
-
-    # 3. 初始化推理器并运行
     inferencer = Inferencer(args.model, model)
-    inferencer.infer(test_data_loader, args.save_dir)
-    save_dir_abs = os.path.abspath(args.save_dir)
-    subprocess.run(['explorer', save_dir_abs], shell=True)
+
+
+    # 调用便捷函数进行推理并保存
+    inferencer.infer_and_save(args.input, args.output)

@@ -142,9 +142,9 @@ class Trainer:
                 self.monitor_best = epoch_metric
                 self.save_checkpoint(epoch, save_best=True)
 
-            if self.global_step >= 200000:
-                print(f"已完成论文要求的{200000}次迭代，训练正常终止")
-                break
+            # if self.global_step >= 200000:
+            #     print(f"已完成论文要求的{200000}次迭代，训练正常终止")
+            #     break
 
         self.logger.info("Training finished! Total time: %.2f sec", time.time() - start_time)
 
@@ -239,7 +239,7 @@ class Trainer:
 
                 with torch.amp.autocast('cuda', enabled=self.use_amp):
                     prob = self.model(c)
-                h = torch.bernoulli(prob).detach().float()
+                h = (prob > 0.5).float().contiguous()
 
                 psnr = calculate_hvs_psnr(c, h)
                 cssim_score = cssim(c, h)

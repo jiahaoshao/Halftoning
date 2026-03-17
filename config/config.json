@@ -8,7 +8,7 @@
 	"save_dir": "./",
     "initial_ckpt": "halftoning_dev/model_last.pth.tar",
     "trainer": {
-        "epochs": 1000,
+        "epochs": 3000,
         "save_epochs": 5,
         "val_epochs": 1,
         "log_epochs": 20,
@@ -27,12 +27,12 @@
     "optimizer_type": "Adam",
     "optimizer": {
         "lr": 3e-4,
-        "weight_decay": 1e-5,
+        "weight_decay": 0,
         "fused": true
     },
     "lr_scheduler_type": "CosineAnnealingLR",
     "lr_scheduler": {
-        "T_max": 1000,
+        "T_max": 3000,
         "eta_min": 1e-5,
         "last_epoch": -1
     },

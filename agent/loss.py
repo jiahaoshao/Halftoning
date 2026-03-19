@@ -27,7 +27,6 @@ CSSIM_K1 = 0.01
 CSSIM_K2 = 0.03
 CSSIM_K = 2.0
 DYNAMIC_RANGE_L = 1.0
-REWARD_WS = 0.06
 CSSIM_WIN_SIGMA = 1.5
 
 # 数值稳定性常量
@@ -46,6 +45,11 @@ def check_device(tensor: Tensor, func_name: str) -> None:
 def safe_contiguous(tensor: Tensor) -> Tensor:
     return tensor.contiguous() if not tensor.is_contiguous() else tensor
 
+def reflect_conv2d(x: Tensor, kernel: Tensor, padding: int, groups: int = 1) -> Tensor:
+    if padding > 0:
+        x = F.pad(x, (padding, padding, padding, padding), mode="reflect")
+    return F.conv2d(x, kernel, padding=0, groups=groups)
+
 
 # ====================== 预计算核缓存 ======================
 @lru_cache(maxsize=1)
@@ -58,8 +62,8 @@ def create_nasanen_hvs_kernel() -> Tensor:
     half_size = HVS_HALF_KERNEL
     pixel_per_degree = HVS_SCALE_S
 
-    x = np.arange(-half_size, half_size + 1, dtype=np.float64) / pixel_per_degree
-    y = np.arange(-half_size, half_size + 1, dtype=np.float64) / pixel_per_degree
+    x = np.arange(-half_size, half_size + 1, dtype=np.float64)
+    y = np.arange(-half_size, half_size + 1, dtype=np.float64)
     xx, yy = np.meshgrid(x, y)
 
     S_L = NASANEN_A * (NASANEN_L ** NASANEN_B)
@@ -116,14 +120,13 @@ HVS_KERNEL = create_nasanen_hvs_kernel()
 CSSIM_GAUSS_KERNEL = create_cssim_gaussian_kernel()
 HVS_PADDING = HVS_HALF_KERNEL
 
-
 # ====================== Näsänen HVS低通滤波 ======================
 def hvs_filter(x: Tensor, padding: int = HVS_PADDING) -> Tensor:
     """基于Näsänen HVS模型的人眼视觉低通滤波"""
     check_device(x, "hvs_filter")
     x = torch.clamp(x, 0.0, 1.0)
     x = safe_contiguous(x)
-    return F.conv2d(x, HVS_KERNEL, padding=padding, groups=x.shape[1])
+    return reflect_conv2d(x, HVS_KERNEL, padding=padding, groups=x.shape[1])
 
 
 # ====================== 逐像素 SSIM ======================
@@ -134,7 +137,6 @@ def pixelwise_ssim(
         K: Tuple[float, float] = (CSSIM_K1, CSSIM_K2),
         win: Optional[Tensor] = None,
 ) -> Tensor:
-    """返回 SSIM 图 [B,1,H,W]"""
     if x.dim() == 3:
         x = x.unsqueeze(1)
         y = y.unsqueeze(1)
@@ -144,17 +146,16 @@ def pixelwise_ssim(
     if win is None:
         win = CSSIM_GAUSS_KERNEL
 
-    mu_x = F.conv2d(x, win, padding=HVS_HALF_KERNEL, groups=C)
-    mu_y = F.conv2d(y, win, padding=HVS_HALF_KERNEL, groups=C)
+    mu_x = reflect_conv2d(x, win, padding=HVS_HALF_KERNEL, groups=C)
+    mu_y = reflect_conv2d(y, win, padding=HVS_HALF_KERNEL, groups=C)
 
     mu_x_sq = mu_x ** 2
     mu_y_sq = mu_y ** 2
     mu_xy = mu_x * mu_y
-    sigma_x_sq = F.conv2d(x ** 2, win, padding=HVS_HALF_KERNEL, groups=C) - mu_x_sq
-    sigma_y_sq = F.conv2d(y ** 2, win, padding=HVS_HALF_KERNEL, groups=C) - mu_y_sq
-    sigma_x_sq = torch.clamp(sigma_x_sq, min=0.0)  # 防止浮点负值
-    sigma_y_sq = torch.clamp(sigma_y_sq, min=0.0)
-    sigma_xy = F.conv2d(x * y, win, padding=HVS_HALF_KERNEL, groups=C) - mu_xy
+
+    sigma_x_sq = reflect_conv2d(x ** 2, win, padding=HVS_HALF_KERNEL, groups=C) - mu_x_sq
+    sigma_y_sq = reflect_conv2d(y ** 2, win, padding=HVS_HALF_KERNEL, groups=C) - mu_y_sq
+    sigma_xy = reflect_conv2d(x * y, win, padding=HVS_HALF_KERNEL, groups=C) - mu_xy
 
     C1 = (K[0] * data_range) ** 2
     C2 = (K[1] * data_range) ** 2
@@ -172,11 +173,11 @@ def compute_sigma_c(c: Tensor) -> Tensor:
     c = torch.clamp(c, 0.0, 1.0)
     c = safe_contiguous(c)
 
-    mu_c = F.conv2d(c, CSSIM_GAUSS_KERNEL, padding=HVS_PADDING, groups=C)
-    c_minus_mu_sq = torch.clamp((c - mu_c) ** 2, min=EPS)
-    var_c = F.conv2d(c_minus_mu_sq, CSSIM_GAUSS_KERNEL, padding=HVS_PADDING, groups=C)
+    mu_c = reflect_conv2d(c, CSSIM_GAUSS_KERNEL, padding=HVS_PADDING, groups=C)
+    mu_c_sq = reflect_conv2d(c ** 2, CSSIM_GAUSS_KERNEL, padding=HVS_PADDING, groups=C)
+    var_c = torch.clamp(mu_c_sq - mu_c ** 2, min=EPS)
     sigma_c = CSSIM_K * torch.sqrt(var_c)
-    sigma_c_max = torch.amax(sigma_c, dim=(1, 2, 3), keepdim=True).clamp(min=EPS)
+    sigma_c_max = sigma_c.view(B, -1).max(dim=1)[0].view(B, 1, 1, 1).clamp(min=EPS)
     sigma_c = sigma_c / sigma_c_max
     return torch.clamp(sigma_c, 0.0, 1.0)
 
@@ -191,7 +192,7 @@ def cssim(c: Tensor, h: Tensor, sigma_c: Optional[Tensor] = None) -> Tensor:
     if sigma_c is None:
         sigma_c = compute_sigma_c(c)
 
-    ssim_map = pixelwise_ssim(c, h, data_range=DYNAMIC_RANGE_L)
+    ssim_map = pixelwise_ssim(c, h)
     cssim_map = sigma_c * ssim_map + (1 - sigma_c) * 1.0
     cssim_map = torch.clamp(cssim_map, min=EPS, max=1.0)
     return cssim_map.mean(dim=(1, 2, 3))  # [B]
@@ -200,7 +201,7 @@ def cssim(c: Tensor, h: Tensor, sigma_c: Optional[Tensor] = None) -> Tensor:
 def le_gradient_estimator(
         c: torch.Tensor,
         prob: torch.Tensor,
-        w_s: float = REWARD_WS,
+        w_s: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     check_device(c, "le_gradient_estimator")
     check_device(prob, "le_gradient_estimator")
@@ -212,7 +213,7 @@ def le_gradient_estimator(
     prob = prob.to(dtype=DEFAULT_DTYPE, non_blocking=True)
     prob = torch.clamp(prob, PROB_CLAMP_MIN, PROB_CLAMP_MAX)
 
-    h_sample = torch.bernoulli(prob).detach()
+    h_sample = torch.bernoulli(prob)
 
     sigma_c = compute_sigma_c(c)
     c_hvs = hvs_filter(c, padding=HVS_PADDING)
@@ -221,8 +222,8 @@ def le_gradient_estimator(
 
     kernel = HVS_KERNEL
     kernel_sq = HVS_KERNEL ** 2
-    conv_diff = F.conv2d(diff, kernel, padding=HVS_HALF_KERNEL, groups=C)
-    conv_k2 = F.conv2d(torch.ones_like(diff), kernel_sq, padding=HVS_HALF_KERNEL, groups=C)
+    conv_diff = reflect_conv2d(diff, kernel, padding=HVS_HALF_KERNEL, groups=C)
+    conv_k2 = reflect_conv2d(torch.ones_like(diff), kernel_sq, padding=HVS_HALF_KERNEL, groups=C)
 
     delta_0 = -h_sample
     delta_1 = 1.0 - h_sample
@@ -230,10 +231,8 @@ def le_gradient_estimator(
     delta_Rmse_0 = -(2.0 * delta_0 * conv_diff + delta_0 ** 2 * conv_k2)
     delta_Rmse_1 = -(2.0 * delta_1 * conv_diff + delta_1 ** 2 * conv_k2)
 
-    # CSSIM 部分：grad_cssim 乘以 N 以匹配量级
-    h_grad = h_sample.detach().clone().requires_grad_(True)
-    cssim_val = cssim(c, h_grad, sigma_c)
-    grad_cssim = torch.autograd.grad(cssim_val.sum(), h_grad, retain_graph=False)[0] * N
+    cssim_val = cssim(c, h_sample, sigma_c)
+    grad_cssim = torch.autograd.grad(cssim_val.sum(), h_sample, retain_graph=True)[0]
 
     delta_Rcssim_0 = w_s * grad_cssim * delta_0
     delta_Rcssim_1 = w_s * grad_cssim * delta_1
@@ -243,7 +242,11 @@ def le_gradient_estimator(
 
     prob_0 = 1.0 - prob
     prob_1 = prob
-    loss_marl = -(prob_0 * delta_R0 + prob_1 * delta_R1).mean()
+
+    # 先对每个样本自身做归一化
+    advantage = prob_0 * delta_R0 + prob_1 * delta_R1  # [B,1,H,W]
+    adv_std = advantage.detach().std(dim=(2, 3), keepdim=True).clamp(min=1e-4)  # [B,1,1,1]
+    loss_marl = -(advantage / adv_std).mean()
 
     delta_norm = (delta_R0.abs() + delta_R1.abs()).mean().detach()
     return loss_marl, delta_norm
@@ -251,30 +254,47 @@ def le_gradient_estimator(
 
 # ====================== 各向异性抑制损失（论文式3-19）======================
 def anisotropy_suppression_loss(prob: Tensor) -> Tensor:
-    """向量化实现，对齐论文式 (3-19)"""
+    """更严格对齐论文式(3-19)的 LAS 实现"""
     check_device(prob, "anisotropy_suppression_loss")
     B, C, H, W = prob.shape
-    prob_sq = prob.squeeze(1).to(DEFAULT_DTYPE)
+    assert C == 1, "anisotropy_suppression_loss only supports single channel"
+
+    prob_sq = prob[:, 0].to(DEFAULT_DTYPE)
     prob_sq = torch.clamp(prob_sq, min=PROB_CLAMP_MIN, max=PROB_CLAMP_MAX)
 
-    r, max_r, r_count, r_mask, r_vals = get_radial_coords(H, W)
-    r_flat = r.flatten()
+    r, max_r, r_count, _, _ = get_radial_coords(H, W)
+    r_flat = r.reshape(-1)
 
-    fft = torch.fft.fft2(prob_sq)
-    fft_shift = torch.fft.fftshift(fft)
-    P_hat = torch.abs(fft_shift) ** 2 / (H * W) + EPS
+    fft = torch.fft.fft2(prob_sq, norm="ortho")
+    fft_shift = torch.fft.fftshift(fft, dim=(-2, -1))
+
+    # 严格按公式使用功率谱
+    P_hat = torch.abs(fft_shift) ** 2
+
+    # Per-sample spectral-energy normalization to prevent LAS spikes from dominating MARL.
+    non_dc = (r >= 1).unsqueeze(0).to(P_hat.dtype)
+    non_dc_count = non_dc.sum(dim=(1, 2)).clamp(min=1.0)
+    spectrum_energy = (P_hat * non_dc).sum(dim=(1, 2), keepdim=True) / non_dc_count.unsqueeze(1).unsqueeze(2)
+    P_hat = P_hat / (spectrum_energy + EPS)
     P_flat = P_hat.reshape(B, -1)
 
-    P_rho = torch.zeros(B, max_r + 1, device=DEVICE, dtype=DEFAULT_DTYPE)
-    P_rho.scatter_add_(1, r_flat.unsqueeze(0).expand(B, -1), P_flat)
-    r_count_safe = r_count.clamp(min=1)
-    P_rho = P_rho / r_count_safe.unsqueeze(0)
+    # 计算每个径向频率上的平均功率谱 P(f_rho)
+    P_rho_sum = torch.zeros(B, max_r + 1, device=prob.device, dtype=DEFAULT_DTYPE)
+    P_rho_sum.scatter_add_(1, r_flat.unsqueeze(0).expand(B, -1), P_flat)
 
+    r_count = r_count.clamp(min=1).to(DEFAULT_DTYPE)
+    P_rho = P_rho_sum / r_count.unsqueeze(0)
+
+    # 将径向平均谱展开回每个频点
     P_rho_expand = P_rho[:, r_flat].reshape(B, H, W)
-    non_dc = (r >= 1).unsqueeze(0).expand_as(P_hat)
-    loss = ((P_hat - P_rho_expand) ** 2 * non_dc).mean(dim=(1, 2)).mean()
 
-    return torch.clamp(loss, min=1e-6).to(DEFAULT_DTYPE)
+    # Huber-like robust penalty reduces occasional outlier frequencies.
+    spectral_residual = (P_hat - P_rho_expand) * non_dc
+    loss_per_sample = torch.sqrt(spectral_residual ** 2 + 1e-6).sum(dim=(1, 2))
+    loss_per_sample = loss_per_sample / non_dc_count
+    # batch 维做平均
+    loss = loss_per_sample.mean()
+    return loss.to(DEFAULT_DTYPE)
 
 
 # ====================== 验证指标：HVS-PSNR ======================

@@ -112,7 +112,7 @@ class Trainer:
                 avg_psnr, avg_cssim = self._valid_epoch(epoch)
 
             # 论文对齐的综合指标
-            epoch_metric = 0.5 * avg_psnr + 15.0 * avg_cssim
+            epoch_metric = avg_psnr + 40 * avg_cssim
 
             #  epoch日志打印
             self.logger.info("[*] --- epoch: %d/%d | loss: %.17g | metric: %.17g | lr: %.17g | time-consumed: %.17gs ---",
@@ -167,7 +167,7 @@ class Trainer:
             prob = prob.float().contiguous()
             c = c.float().contiguous()
             # 计算LE梯度估计器损失
-            marl_loss, grad_norm = le_gradient_estimator(c, prob)
+            marl_loss, grad_norm = le_gradient_estimator(c, prob, self.w_s)
 
             # ====================== 2. 优化LAS损失 论文蓝噪声特性 ======================
             with torch.amp.autocast('cuda', enabled=self.use_amp):
@@ -183,17 +183,17 @@ class Trainer:
             total_loss = marl_loss + self.w_a * las_loss
 
             # ====================== 4. 反向传播与参数更新 ======================
-            self.optimizer.zero_grad(set_to_none=True)
+            self.optimizer.zero_grad()
             if self.use_amp:
                 self.scaler.scale(total_loss).backward()
                 self.scaler.unscale_(self.optimizer)
                 # 梯度裁剪，阈值调整为1.0，避免有效梯度被裁剪
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                 self.optimizer.step()
 
             self.global_step += 1

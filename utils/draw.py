@@ -8,10 +8,10 @@ def read_txt(file_path):
     return data
 
 # 替换为实际文件路径
-psnr_data = read_txt("../halftoning_dev/train_cache/psnr.txt")
-cssim_data = read_txt("../halftoning_dev/train_cache/cssim.txt")
-total_loss = read_txt("../halftoning_dev/train_cache/total_loss.txt")
-lr_data = read_txt("../halftoning_dev/train_cache/lr.txt")
+psnr_data = read_txt("halftoning_dev/train_cache/psnr.txt")
+cssim_data = read_txt("halftoning_dev/train_cache/cssim.txt")
+total_loss = read_txt("halftoning_dev/train_cache/total_loss.txt")
+lr_data = read_txt("halftoning_dev/train_cache/lr.txt")
 
 # 绘制趋势图
 fig, axes = plt.subplots(2, 2, figsize=(12, 8))

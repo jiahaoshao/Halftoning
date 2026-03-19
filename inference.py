@@ -4,6 +4,7 @@ import cv2
 import os
 import argparse
 import torch
+import time
 from agent.model import HalftoningPolicyNet
 from collections import OrderedDict
 
@@ -65,8 +66,11 @@ class Inferencer:
         # 1. 加载并预处理图片
         img_tensor = self._load_image(input_path)
 
-        # 2. 调用核心推理函数
+        # 2. 调用核心推理函数  
+        st = time.time()
         halftone_tensor = self.infer(img_tensor)
+        et = time.time()
+        print(f"Inference completed in {(et - st) * 1000:.3f} ms.")
 
         # 3. 确定最终保存路径
         # 判断 output_path 是否为文件夹，或者是否没有后缀
